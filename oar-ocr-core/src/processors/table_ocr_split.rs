@@ -45,7 +45,7 @@ pub struct SplitConfig {
 impl Default for SplitConfig {
     fn default() -> Self {
         Self {
-            min_overlap_ratio: 0.05, // Low threshold to catch partial overlaps
+            min_overlap_ratio: 0.15, // Require meaningful overlap to avoid splitting marginal boxes
             min_cells_to_split: 2,
             split_horizontal: true,
             split_vertical: true,
@@ -367,8 +367,27 @@ fn split_horizontally(
         return segments;
     }
 
-    // Calculate width ratios for text distribution
+    // Skip splitting if any segment is too small (< 15% of total width).
+    // Tiny segments produce meaningless text fragments (e.g. "1" from "10.73.250.135")
+    // and corrupt both the source and target cells.
     let total_width: f32 = x_ranges.iter().map(|(x1, x2)| x2 - x1).sum();
+    if total_width > 0.0 {
+        let min_ratio = x_ranges
+            .iter()
+            .map(|(x1, x2)| (x2 - x1) / total_width)
+            .fold(f32::MAX, f32::min);
+        if min_ratio < 0.15 {
+            // Assign entire text to the cell with the largest overlap
+            let best_cell = find_best_matching_cell(ocr_bbox, cell_indices, cells);
+            return vec![SplitSegment {
+                bbox: ocr_bbox.clone(),
+                text: text.to_string(),
+                cell_index: best_cell,
+            }];
+        }
+    }
+
+    // Calculate width ratios for text distribution
     let ratios: Vec<f32> = x_ranges
         .iter()
         .map(|(x1, x2)| (x2 - x1) / total_width)
@@ -431,6 +450,23 @@ fn split_vertically(
 
     if y_ranges.is_empty() {
         return segments;
+    }
+
+    // Skip splitting if any segment is too small (< 15% of total height).
+    let total_height_check: f32 = y_ranges.iter().map(|(y1, y2)| y2 - y1).sum();
+    if total_height_check > 0.0 {
+        let min_ratio = y_ranges
+            .iter()
+            .map(|(y1, y2)| (y2 - y1) / total_height_check)
+            .fold(f32::MAX, f32::min);
+        if min_ratio < 0.15 {
+            let best_cell = find_best_matching_cell(ocr_bbox, cell_indices, cells);
+            return vec![SplitSegment {
+                bbox: ocr_bbox.clone(),
+                text: text.to_string(),
+                cell_index: best_cell,
+            }];
+        }
     }
 
     // For vertical splits, try to split by lines first
