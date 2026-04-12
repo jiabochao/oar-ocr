@@ -45,7 +45,7 @@ pub struct SplitConfig {
 impl Default for SplitConfig {
     fn default() -> Self {
         Self {
-            min_overlap_ratio: 0.15, // Require meaningful overlap to avoid splitting marginal boxes
+            min_overlap_ratio: 0.05, // Low threshold to catch partial overlaps
             min_cells_to_split: 2,
             split_horizontal: true,
             split_vertical: true,
@@ -377,10 +377,23 @@ fn split_horizontally(
             .map(|(x1, x2)| (x2 - x1) / total_width)
             .fold(f32::MAX, f32::min);
         if min_ratio < 0.15 {
-            // Assign entire text to the cell with the largest overlap
-            let best_cell = find_best_matching_cell(ocr_bbox, cell_indices, cells);
+            // Assign entire text to the cell with the largest overlap.
+            // Use the largest segment's bbox (not the original) so IoA stays
+            // high with the target cell and downstream matching works.
+            let (best_x1, best_x2) = x_ranges
+                .iter()
+                .copied()
+                .max_by(|(a1, a2), (b1, b2)| {
+                    (a2 - a1)
+                        .partial_cmp(&(b2 - b1))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or((ocr_x_min, ocr_x_max));
+            let segment_bbox =
+                BoundingBox::from_coords(best_x1, ocr_y_min, best_x2, ocr_y_max);
+            let best_cell = find_best_matching_cell(&segment_bbox, cell_indices, cells);
             return vec![SplitSegment {
-                bbox: ocr_bbox.clone(),
+                bbox: segment_bbox,
                 text: text.to_string(),
                 cell_index: best_cell,
             }];
@@ -460,9 +473,21 @@ fn split_vertically(
             .map(|(y1, y2)| (y2 - y1) / total_height_check)
             .fold(f32::MAX, f32::min);
         if min_ratio < 0.15 {
-            let best_cell = find_best_matching_cell(ocr_bbox, cell_indices, cells);
+            // Use the largest segment's bbox so IoA stays high with the target cell.
+            let (best_y1, best_y2) = y_ranges
+                .iter()
+                .copied()
+                .max_by(|(a1, a2), (b1, b2)| {
+                    (a2 - a1)
+                        .partial_cmp(&(b2 - b1))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or((ocr_y_min, ocr_y_max));
+            let segment_bbox =
+                BoundingBox::from_coords(ocr_x_min, best_y1, ocr_x_max, best_y2);
+            let best_cell = find_best_matching_cell(&segment_bbox, cell_indices, cells);
             return vec![SplitSegment {
-                bbox: ocr_bbox.clone(),
+                bbox: segment_bbox,
                 text: text.to_string(),
                 cell_index: best_cell,
             }];
