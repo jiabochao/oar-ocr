@@ -101,14 +101,13 @@ impl TableCellDetectionAdapter {
         let (boxes, class_ids, scores) = self.postprocessor.apply(predictions, img_shapes);
         let mut all_cells = Vec::with_capacity(boxes.len());
 
-        for (img_boxes, (img_classes, img_scores)) in boxes
-            .into_iter()
-            .zip(class_ids.into_iter().zip(scores.into_iter()))
+        for (img_boxes, (img_classes, img_scores)) in
+            boxes.into_iter().zip(class_ids.into_iter().zip(scores))
         {
             let mut cells = Vec::new();
             for (bbox, (class_id, score)) in img_boxes
                 .into_iter()
-                .zip(img_classes.into_iter().zip(img_scores.into_iter()))
+                .zip(img_classes.into_iter().zip(img_scores))
             {
                 if score < config.score_threshold {
                     continue;
@@ -155,7 +154,7 @@ impl ModelAdapter for TableCellDetectionAdapter {
                     num_classes: self.model_config.num_classes,
                 };
                 let (output, img_shapes) = model
-                    .forward(input.images, &postprocess_config)
+                    .forward(input.into_owned_images(), &postprocess_config)
                     .map_err(|e| {
                         OCRError::adapter_execution_error(
                             "TableCellDetectionAdapter",
