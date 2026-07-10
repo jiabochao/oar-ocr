@@ -2,9 +2,7 @@ use super::config::{EosTokenId, GlmOcrConfig, GlmOcrImageProcessorConfig};
 use super::processing::{GlmOcrImageInputs, preprocess_image};
 use super::text::GlmOcrTextModel;
 use super::vision::GlmOcrVisionModel;
-use crate::utils::{
-    candle_to_ocr_inference, candle_to_ocr_processing, truncate_repetitive_content,
-};
+use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear_no_bias};
 use image::RgbImage;
@@ -49,15 +47,12 @@ impl GlmOcr {
             });
         }
 
-        let dtype = device.bf16_default_to_f32();
-        // SAFETY: The mmap'd file must not be modified or deleted while in use.
+        let dtype = crate::utils::select_dtype(&device);
+        let weight_files = crate::utils::collect_safetensors(model_dir, "GLM-OCR")?;
+        // SAFETY: The mmap'd files must not be modified or deleted while in use.
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[model_dir.join("model.safetensors")],
-                dtype,
-                &device,
-            )
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "load model.safetensors", e))?
+            VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)
+                .map_err(|e| candle_to_ocr_inference("GLM-OCR", "load safetensors", e))?
         };
 
         let image_token_id = cfg.image_token_id;
@@ -122,10 +117,13 @@ impl GlmOcr {
             })];
         }
 
-        match self.generate_internal(images, instructions, max_new_tokens) {
-            Ok(results) => results.into_iter().map(Ok).collect(),
+        match self.generate_tokens_internal(images, instructions, max_new_tokens) {
+            Ok(results) => results
+                .into_iter()
+                .map(|tokens| self.decode_generated_tokens(&tokens))
+                .collect(),
             Err(e) => {
-                let msg = format!("generation failed: {e}");
+                let msg = crate::utils::error_chain_message("generation failed", &e);
                 (0..images.len())
                     .map(|_| {
                         Err(OCRError::InvalidInput {
@@ -137,12 +135,49 @@ impl GlmOcr {
         }
     }
 
-    fn generate_internal(
+    /// Generate raw token ids without post-processing. Tokens are exactly the
+    /// ids emitted by the decode loop, excluding stop tokens, before tokenizer
+    /// decoding or repetition truncation.
+    pub fn generate_tokens(
         &self,
         images: &[RgbImage],
         instructions: &[impl AsRef<str>],
         max_new_tokens: usize,
-    ) -> Result<Vec<String>, OCRError> {
+    ) -> Vec<Result<Vec<u32>, OCRError>> {
+        if images.is_empty() {
+            return Vec::new();
+        }
+        if images.len() != instructions.len() {
+            return vec![Err(OCRError::InvalidInput {
+                message: format!(
+                    "GLM-OCR: images count ({}) != instructions count ({})",
+                    images.len(),
+                    instructions.len()
+                ),
+            })];
+        }
+
+        match self.generate_tokens_internal(images, instructions, max_new_tokens) {
+            Ok(results) => results.into_iter().map(Ok).collect(),
+            Err(e) => {
+                let msg = crate::utils::error_chain_message("generation failed", &e);
+                (0..images.len())
+                    .map(|_| {
+                        Err(OCRError::InvalidInput {
+                            message: msg.clone(),
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn generate_tokens_internal(
+        &self,
+        images: &[RgbImage],
+        instructions: &[impl AsRef<str>],
+        max_new_tokens: usize,
+    ) -> Result<Vec<Vec<u32>>, OCRError> {
         let mut results = Vec::with_capacity(images.len());
 
         for (image, instruction) in images.iter().zip(instructions.iter()) {
@@ -243,17 +278,38 @@ impl GlmOcr {
                 logits = self.logits_from_hidden(&last)?;
             }
 
-            let decoded =
-                self.tokenizer
-                    .decode(&generated, true)
-                    .map_err(|e| OCRError::InvalidInput {
-                        message: format!("GLM-OCR: tokenizer decode failed: {e}"),
-                    })?;
-            let decoded = truncate_repetitive_content(&decoded, 10, 10, 10);
-            results.push(decoded.trim().to_string());
+            results.push(generated);
         }
 
         Ok(results)
+    }
+
+    pub fn decode_tokens(&self, tokens: &[u32]) -> Result<String, OCRError> {
+        self.decode_generated_tokens(tokens)
+    }
+
+    /// Decode tokens **without** applying GLM-OCR's repetition-collapse
+    /// post-process. Use this when the raw token sequence is needed before
+    /// any post-processing — for example when feeding output to another
+    /// model that operates at token granularity.
+    pub fn decode_tokens_raw(&self, tokens: &[u32]) -> Result<String, OCRError> {
+        let decoded = self
+            .tokenizer
+            .decode(tokens, true)
+            .map_err(|e| OCRError::InvalidInput {
+                message: format!("GLM-OCR: tokenizer decode failed: {e}"),
+            })?;
+        Ok(decoded.trim().to_string())
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    fn decode_generated_tokens(&self, tokens: &[u32]) -> Result<String, OCRError> {
+        // No Rust-specific truncation heuristic — match official GLM-OCR behavior.
+        // The official implementation relies on EOS-based stopping only.
+        self.decode_tokens_raw(tokens)
     }
 
     fn prepare_inputs(

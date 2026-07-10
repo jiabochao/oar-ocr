@@ -112,7 +112,15 @@ impl ModelAdapter for TextRecognitionAdapter {
     }
 
     fn recommended_batch_size(&self) -> usize {
-        32
+        // The pipeline pools crops across *all* images, sorts them by width/height
+        // ratio, and chunks them into batches — so consecutive crops in a batch
+        // have nearly identical widths and the per-batch zero-padding stays
+        // minimal regardless of batch size. That decouples batch size from the
+        // padding-induced output drift that plagues per-image batching, leaving
+        // batch size as a pure throughput knob: larger batches keep the GPU busy
+        // and amortize launch/decode overhead. On PP-OCRv6 + OmniDocBench, 64 is
+        // the throughput sweet spot. Callers can override via `region_batch_size`.
+        64
     }
 }
 
@@ -128,12 +136,23 @@ impl_adapter_builder! {
         preprocess_config: CRNNPreprocessConfig = CRNNPreprocessConfig::default(),
         character_dict: Option<Vec<String>> = None,
         return_word_box: bool = false,
+        model_name_override: Option<String> = None,
     },
 
     methods: {
         /// Sets the model input shape.
         pub fn model_input_shape(mut self, shape: [usize; 3]) -> Self {
             self.preprocess_config.model_input_shape = shape;
+            self
+        }
+
+        /// Overrides the reported model name (e.g. `PP-OCRv5_server_rec`).
+        ///
+        /// This is identification metadata only — it labels the model in logs and
+        /// error messages and does not change preprocessing/inference, which are
+        /// driven by the config, dictionary, and the ONNX model itself.
+        pub fn model_name(mut self, model_name: impl Into<String>) -> Self {
+            self.model_name_override = Some(model_name.into());
             self
         }
 
@@ -162,7 +181,7 @@ impl_adapter_builder! {
         }
     }
 
-    build: |builder: TextRecognitionAdapterBuilder, model_path: &std::path::Path| -> Result<TextRecognitionAdapter, OCRError> {
+    build: |builder: TextRecognitionAdapterBuilder, model_source: crate::core::ModelSource| -> Result<TextRecognitionAdapter, OCRError> {
         let (task_config, ort_config) = builder.config
             .into_validated_parts()
             .map_err(|err| OCRError::ConfigError {
@@ -176,10 +195,13 @@ impl_adapter_builder! {
             model_builder = model_builder.character_dict(character_dict);
         }
 
-        let model = apply_ort_config!(model_builder, ort_config).build(model_path)?;
+        let model = apply_ort_config!(model_builder, ort_config).build(model_source)?;
 
         // Create adapter info using the helper
-        let info = TextRecognitionAdapterBuilder::base_adapter_info();
+        let mut info = TextRecognitionAdapterBuilder::base_adapter_info();
+        if let Some(model_name) = builder.model_name_override {
+            info.model_name = model_name;
+        }
 
         Ok(TextRecognitionAdapter {
             model,

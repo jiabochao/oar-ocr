@@ -7,7 +7,6 @@ use crate::TaskPredictorBuilder;
 use crate::core::OcrResult;
 use crate::core::errors::OCRError;
 use crate::core::traits::OrtConfigurable;
-use crate::core::traits::adapter::AdapterBuilder;
 use crate::core::traits::task::ImageTaskInput;
 use crate::domain::adapters::TextRecognitionAdapterBuilder;
 use crate::domain::tasks::text_recognition::{TextRecognitionConfig, TextRecognitionTask};
@@ -59,7 +58,6 @@ impl TextRecognitionPredictorBuilder {
         Self {
             state: PredictorBuilderState::new(TextRecognitionConfig {
                 score_threshold: 0.0,
-                max_text_length: 100,
             }),
             dict_path: None,
         }
@@ -70,22 +68,21 @@ impl TextRecognitionPredictorBuilder {
         self
     }
 
-    pub fn max_text_length(mut self, max_length: usize) -> Self {
-        self.state.config_mut().max_text_length = max_length;
-        self
-    }
-
     pub fn dict_path<P: AsRef<Path>>(mut self, path: P) -> Self {
         self.dict_path = Some(path.as_ref().to_path_buf());
         self
     }
 
-    pub fn build<P: AsRef<Path>>(self, model_path: P) -> OcrResult<TextRecognitionPredictor> {
+    pub fn build(
+        self,
+        model_source: impl Into<crate::core::ModelSource>,
+    ) -> OcrResult<TextRecognitionPredictor> {
         let Self { state, dict_path } = self;
         let (config, ort_config) = state.into_parts();
 
         let dict_path = dict_path
             .ok_or_else(|| OCRError::missing_field("dict_path", "TextRecognitionPredictor"))?;
+        let dict_path = super::resolve_asset_path(&dict_path)?;
 
         // Load character dictionary from file
         let character_dict = std::fs::read_to_string(&dict_path)?
@@ -101,7 +98,7 @@ impl TextRecognitionPredictorBuilder {
             adapter_builder = adapter_builder.with_ort_config(ort_cfg);
         }
 
-        let adapter = Box::new(adapter_builder.build(model_path.as_ref())?);
+        let adapter = super::build_adapter(adapter_builder, model_source)?;
         let task = TextRecognitionTask::new(config.clone());
         Ok(TextRecognitionPredictor {
             core: TaskPredictorCore::new(adapter, task, config),

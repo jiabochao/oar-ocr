@@ -12,7 +12,7 @@ pub mod table;
 pub mod text;
 
 use ::image::{GrayImage, RgbImage};
-use candle_core::{Device, IndexOp, Tensor};
+use candle_core::{DType, Device, Tensor};
 use oar_ocr_core::core::OCRError;
 use oar_ocr_core::domain::structure::{LayoutElement, LayoutElementType};
 use oar_ocr_core::processors::BoundingBox;
@@ -55,9 +55,9 @@ use std::collections::HashSet;
 /// let cuda1 = parse_device("cuda:1")?;
 ///
 /// // Metal examples (only when metal feature is enabled)
-/// # #[cfg(feature = "metal")]
+/// # #[cfg(all(feature = "metal", target_os = "macos"))]
 /// let metal = parse_device("metal")?;
-/// # #[cfg(feature = "metal")]
+/// # #[cfg(all(feature = "metal", target_os = "macos"))]
 /// let metal1 = parse_device("metal:1")?;
 /// # Ok(())
 /// # }
@@ -69,15 +69,15 @@ fn cuda_not_enabled() -> OCRError {
     }
 }
 
-#[cfg(not(feature = "metal"))]
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
 fn metal_not_enabled() -> OCRError {
     OCRError::ConfigError {
-        message: "Metal support not enabled. Compile with --features metal".to_string(),
+        message: "Metal support not enabled. Compile on macOS with --features metal".to_string(),
     }
 }
 
 /// Helper function to parse a device string with an ordinal (e.g., "cuda:1", "metal:0").
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_os = "macos")))]
 fn parse_device_with_ordinal(
     s: &str,
     prefix: &str,
@@ -114,13 +114,13 @@ pub fn parse_device(device_str: &str) -> Result<Device, OCRError> {
             }
         }
         "metal" => {
-            #[cfg(feature = "metal")]
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             {
                 Device::new_metal(0).map_err(|e| OCRError::ConfigError {
                     message: format!("Failed to create Metal device: {}", e),
                 })
             }
-            #[cfg(not(feature = "metal"))]
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
             {
                 Err(metal_not_enabled())
             }
@@ -136,11 +136,11 @@ pub fn parse_device(device_str: &str) -> Result<Device, OCRError> {
             }
         }
         s if s.starts_with("metal:") => {
-            #[cfg(feature = "metal")]
+            #[cfg(all(feature = "metal", target_os = "macos"))]
             {
                 parse_device_with_ordinal(s, "metal:", "Metal", Device::new_metal)
             }
-            #[cfg(not(feature = "metal"))]
+            #[cfg(not(all(feature = "metal", target_os = "macos")))]
             {
                 Err(metal_not_enabled())
             }
@@ -151,6 +151,76 @@ pub fn parse_device(device_str: &str) -> Result<Device, OCRError> {
                 device_str
             ),
         }),
+    }
+}
+
+/// Selects the weight/compute dtype for a VL model on `device`.
+///
+/// BF16 is preferred on accelerators, but Candle's CUDA BF16 kernels are only
+/// compiled for compute capability >= 8.0 (Ampere and newer). On older GPUs
+/// (GTX 10xx/16xx, RTX 20xx, ...) the first BF16 op fails at runtime, so this
+/// probes a tiny BF16 computation on the device and falls back to F16 when
+/// the probe fails. CPU always uses F32.
+///
+/// The `OAR_VL_DTYPE` environment variable (`bf16`, `f16`, or `f32`,
+/// case-insensitive) overrides the automatic choice.
+pub fn select_dtype(device: &Device) -> DType {
+    if let Ok(v) = std::env::var("OAR_VL_DTYPE") {
+        match dtype_from_str(&v) {
+            Some(dtype) => {
+                tracing::info!("using dtype {dtype:?} from OAR_VL_DTYPE={v}");
+                return dtype;
+            }
+            None => {
+                tracing::warn!(
+                    "ignoring invalid OAR_VL_DTYPE value '{v}' (expected bf16, f16, or f32)"
+                );
+            }
+        }
+    }
+
+    if !device.supports_bf16() {
+        return DType::F32;
+    }
+    if bf16_works(device) {
+        DType::BF16
+    } else {
+        tracing::warn!(
+            "device does not support BF16 kernels (CUDA compute capability < 8.0?); \
+             falling back to F16. Set OAR_VL_DTYPE=f32 if you see numerical issues."
+        );
+        DType::F16
+    }
+}
+
+/// Parses a dtype name as accepted by the `OAR_VL_DTYPE` environment variable.
+fn dtype_from_str(s: &str) -> Option<DType> {
+    match s.to_lowercase().as_str() {
+        "bf16" | "bfloat16" => Some(DType::BF16),
+        "f16" | "fp16" | "float16" | "half" => Some(DType::F16),
+        "f32" | "fp32" | "float32" => Some(DType::F32),
+        _ => None,
+    }
+}
+
+/// Runs a tiny BF16 computation on `device` covering the kernel families used
+/// during inference (fill, matmul, affine, cast) and reads the result back,
+/// so missing-kernel and unsupported-cuBLAS errors surface here instead of
+/// mid-inference.
+fn bf16_works(device: &Device) -> bool {
+    let probe = || -> candle_core::Result<()> {
+        let t = Tensor::ones((2, 2), DType::BF16, device)?;
+        let t = t.matmul(&t)?;
+        let t = (t * 2.0)?;
+        t.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
+        Ok(())
+    };
+    match probe() {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!("BF16 probe failed on {device:?}: {e}");
+            false
+        }
     }
 }
 
@@ -167,6 +237,36 @@ pub fn candle_to_ocr_inference(
     }
 }
 
+/// Free device memory in bytes; `None` when it can't be queried
+/// (CPU, Metal, or a CUDA `cuMemGetInfo` failure).
+pub fn free_device_memory(device: &Device) -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(dev) = device {
+        return match dev.cuda_stream().context().mem_get_info() {
+            Ok((free, _total)) => Some(free),
+            Err(e) => {
+                tracing::debug!("querying free CUDA memory failed: {e}");
+                None
+            }
+        };
+    }
+    let _ = device;
+    None
+}
+
+/// Formats an error with its full `source()` chain, so underlying candle /
+/// CUDA failures (e.g. out-of-memory) aren't hidden by the top-level Display.
+pub fn error_chain_message(prefix: &str, e: &(dyn std::error::Error + 'static)) -> String {
+    use std::fmt::Write;
+    let mut chain = format!("{prefix}: {e}");
+    let mut cur = e.source();
+    while let Some(s) = cur {
+        let _ = write!(chain, "\n  caused by: {s}");
+        cur = s.source();
+    }
+    chain
+}
+
 /// Convert Candle error to OCRError for processing operations.
 pub fn candle_to_ocr_processing(
     kind: oar_ocr_core::core::errors::ProcessingStage,
@@ -180,7 +280,151 @@ pub fn candle_to_ocr_processing(
     }
 }
 
-/// Rotate half of the tensor dimensions for RoPE.
+/// Resolve the safetensors weight files for a model directory.
+///
+/// Returns the single `model.safetensors` when present, otherwise the sorted
+/// list of sharded `model-*.safetensors` files. The returned order is
+/// deterministic so `VarBuilder::from_mmaped_safetensors` sees a stable layout.
+///
+/// `model_name` is only used to prefix the error message when no weights are
+/// found.
+pub fn collect_safetensors(
+    model_dir: &std::path::Path,
+    model_name: &str,
+) -> Result<Vec<std::path::PathBuf>, OCRError> {
+    let single = model_dir.join("model.safetensors");
+    if single.exists() {
+        return Ok(vec![single]);
+    }
+
+    let read_dir = std::fs::read_dir(model_dir).map_err(|e| OCRError::ConfigError {
+        message: format!(
+            "{model_name}: cannot read model dir {}: {e}",
+            model_dir.display()
+        ),
+    })?;
+    let mut shards: Vec<std::path::PathBuf> = Vec::new();
+    for entry in read_dir {
+        // Propagate per-entry I/O errors instead of silently dropping them, so a
+        // partially-failed directory scan can't masquerade as "no shards found".
+        let path = entry
+            .map_err(|e| OCRError::ConfigError {
+                message: format!(
+                    "{model_name}: error reading entry in model dir {}: {e}",
+                    model_dir.display()
+                ),
+            })?
+            .path();
+        if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with("model-") && s.ends_with(".safetensors"))
+        {
+            shards.push(path);
+        }
+    }
+    shards.sort();
+    if shards.is_empty() {
+        return Err(OCRError::ConfigError {
+            message: format!(
+                "{model_name}: no model.safetensors or model-*.safetensors found in {}",
+                model_dir.display()
+            ),
+        });
+    }
+    Ok(shards)
+}
+
+/// Read and deserialize a JSON config file (e.g. `config.json` or
+/// `preprocessor_config.json`) into `T`.
+///
+/// `model_name` and `file_name` are only used to build the parse-error message,
+/// matching the historical `"failed to parse {model} {file}: {err}"` format.
+pub fn load_json_config<T: serde::de::DeserializeOwned>(
+    path: impl AsRef<std::path::Path>,
+    model_name: &str,
+    file_name: &str,
+) -> Result<T, OCRError> {
+    let contents = std::fs::read_to_string(path)?;
+    serde_json::from_str(&contents).map_err(|e| OCRError::ConfigError {
+        message: format!("failed to parse {model_name} {file_name}: {e}"),
+    })
+}
+
+/// `serde` default helper: boolean fields that default to `true`.
+pub fn default_true() -> bool {
+    true
+}
+
+/// `serde` default helper: the standard `1/255` pixel rescale factor.
+pub fn default_rescale_factor() -> f32 {
+    1.0 / 255.0
+}
+
+/// Validate that image normalization `mean`/`std` vectors both have length 3
+/// (one entry per RGB channel). Shared by every VL image-processor config.
+pub fn validate_image_mean_std(
+    model_name: &str,
+    image_mean: &[f32],
+    image_std: &[f32],
+) -> Result<(), OCRError> {
+    if image_mean.len() != 3 || image_std.len() != 3 {
+        return Err(OCRError::ConfigError {
+            message: format!(
+                "{model_name} image_mean/std must have length 3, got mean={} std={}",
+                image_mean.len(),
+                image_std.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate that the patch / merge / temporal-patch sizes are all non-zero.
+/// Shared by the VL image-processor configs that emit a single combined check.
+pub fn validate_patch_merge_temporal(
+    model_name: &str,
+    patch_size: usize,
+    merge_size: usize,
+    temporal_patch_size: usize,
+) -> Result<(), OCRError> {
+    if patch_size == 0 || merge_size == 0 || temporal_patch_size == 0 {
+        return Err(OCRError::ConfigError {
+            message: format!("{model_name} patch_size/merge_size/temporal_patch_size must be > 0"),
+        });
+    }
+    Ok(())
+}
+
+/// Build the inverse-frequency vector for a vision rotary embedding:
+/// `inv_freq[j] = 1 / theta^(2j / dim)` for `j in 0..dim/2`, as a `(dim/2,)`
+/// F32 tensor. Computed in f64 then cast to f32 to match the reference. Shared
+/// by the Qwen2-VL-style vision towers (MinerU, PaddleOCR-VL).
+pub fn vision_inv_freq(
+    dim: usize,
+    theta: f64,
+    model_name: &str,
+    device: &Device,
+) -> Result<Tensor, OCRError> {
+    let mut inv_freq = Vec::with_capacity(dim / 2);
+    for i in (0..dim).step_by(2) {
+        let v = 1f64 / theta.powf(i as f64 / dim as f64);
+        inv_freq.push(v as f32);
+    }
+    Tensor::from_vec(inv_freq, (dim / 2,), device).map_err(|e| {
+        candle_to_ocr_processing(
+            oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
+            format!("{model_name}: vision inv_freq tensor failed"),
+            e,
+        )
+    })
+}
+
+/// Rotate half of the last dimension for RoPE: `[x1, x2] -> [-x2, x1]`.
+///
+/// Operates on the final axis only, so it is rank-agnostic — both the 4D
+/// text-attention tensors `(batch, heads, seq, head_dim)` and the 3D
+/// vision-attention tensors `(seq, heads, head_dim)` share this path.
 pub fn rotate_half(x: &Tensor) -> Result<Tensor, OCRError> {
     let d = x.dim(candle_core::D::Minus1).map_err(|e| {
         candle_to_ocr_processing(
@@ -190,20 +434,22 @@ pub fn rotate_half(x: &Tensor) -> Result<Tensor, OCRError> {
         )
     })?;
     let half = d / 2;
-    let x1 = x.i((.., .., .., 0..half)).map_err(|e| {
+    let x1 = x.narrow(candle_core::D::Minus1, 0, half).map_err(|e| {
         candle_to_ocr_processing(
             oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
             "rotate_half slice x1 failed",
             e,
         )
     })?;
-    let x2 = x.i((.., .., .., half..d)).map_err(|e| {
-        candle_to_ocr_processing(
-            oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
-            "rotate_half slice x2 failed",
-            e,
-        )
-    })?;
+    let x2 = x
+        .narrow(candle_core::D::Minus1, half, d - half)
+        .map_err(|e| {
+            candle_to_ocr_processing(
+                oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
+                "rotate_half slice x2 failed",
+                e,
+            )
+        })?;
     let nx2 = x2.neg().map_err(|e| {
         candle_to_ocr_processing(
             oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
@@ -700,6 +946,48 @@ mod tests {
     }
 
     #[test]
+    fn test_error_chain_message_includes_sources() {
+        let root = std::io::Error::other("CUDA_ERROR_OUT_OF_MEMORY");
+        let err = OCRError::Inference {
+            model_name: "PaddleOCR-VL".to_string(),
+            context: "vision attn softmax".to_string(),
+            source: Box::new(root),
+        };
+        let msg = error_chain_message("generation failed", &err);
+        assert_eq!(
+            msg,
+            "generation failed: inference failed in model 'PaddleOCR-VL': vision attn softmax\n  caused by: CUDA_ERROR_OUT_OF_MEMORY"
+        );
+    }
+
+    #[test]
+    fn test_dtype_from_str() {
+        assert_eq!(dtype_from_str("bf16"), Some(DType::BF16));
+        assert_eq!(dtype_from_str("BF16"), Some(DType::BF16));
+        assert_eq!(dtype_from_str("bfloat16"), Some(DType::BF16));
+        assert_eq!(dtype_from_str("f16"), Some(DType::F16));
+        assert_eq!(dtype_from_str("fp16"), Some(DType::F16));
+        assert_eq!(dtype_from_str("f32"), Some(DType::F32));
+        assert_eq!(dtype_from_str("float32"), Some(DType::F32));
+        assert_eq!(dtype_from_str("f64"), None);
+        assert_eq!(dtype_from_str(""), None);
+    }
+
+    #[test]
+    fn test_bf16_probe_detects_incomplete_backend() {
+        // Candle's CPU backend lacks BF16 matmul, so the probe must report
+        // false — the same signal a pre-Ampere CUDA device produces. (The CPU
+        // path never reaches the probe in select_dtype; supports_bf16() short
+        // circuits it to F32.)
+        assert!(!bf16_works(&Device::Cpu));
+    }
+
+    #[test]
+    fn test_select_dtype_cpu_is_f32() {
+        assert_eq!(select_dtype(&Device::Cpu), DType::F32);
+    }
+
+    #[test]
     fn test_parse_device_invalid() {
         let result = parse_device("invalid");
         assert!(result.is_err());
@@ -708,7 +996,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn test_parse_device_metal_with_ordinal() {
         // Test parsing "metal:0" - should always work on Apple devices
@@ -719,7 +1007,7 @@ mod tests {
         // so we don't test them here. The parsing logic itself works correctly.
     }
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     #[test]
     fn test_parse_device_metal_invalid_ordinal() {
         let result = parse_device("metal:abc");
@@ -729,7 +1017,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "metal"))]
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
     #[test]
     fn test_parse_device_metal_not_enabled() {
         let result = parse_device("metal");

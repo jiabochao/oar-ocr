@@ -79,18 +79,10 @@ struct GlmOcrVisionRotaryEmbedding {
 
 impl GlmOcrVisionRotaryEmbedding {
     fn new(dim: usize, device: &Device, dtype: DType) -> Result<Self, OCRError> {
-        let inv_freq: Vec<f32> = (0..dim)
-            .step_by(2)
-            .map(|i| 1f32 / 10000f32.powf(i as f32 / dim as f32))
-            .collect();
-        let inv_freq = Tensor::from_vec(inv_freq, (dim / 2,), device)
-            .map_err(|e| {
-                candle_to_ocr_processing(
-                    oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
-                    "GLM-OCR: create vision inv_freq",
-                    e,
-                )
-            })?
+        // Shared with MinerU2.5 / PaddleOCR-VL: `1 / theta^(i/dim)` computed in
+        // f64 then narrowed to f32 (theta = 10000). The subsequent dtype cast
+        // dominates any f64-vs-f32 difference at the model's working precision.
+        let inv_freq = crate::utils::vision_inv_freq(dim, 10000.0, "GLM-OCR", device)?
             .to_dtype(dtype)
             .map_err(|e| {
                 candle_to_ocr_processing(
@@ -158,8 +150,8 @@ fn apply_rotary_pos_emb_vision(
         )
     })?;
 
-    let q_rot = rotate_half_vision(q)?;
-    let k_rot = rotate_half_vision(k)?;
+    let q_rot = crate::utils::rotate_half(q)?;
+    let k_rot = crate::utils::rotate_half(k)?;
 
     let q_mul = q.broadcast_mul(&cos).map_err(|e| {
         candle_to_ocr_processing(
@@ -205,45 +197,6 @@ fn apply_rotary_pos_emb_vision(
         )
     })?;
     Ok((q_out, k_out))
-}
-
-fn rotate_half_vision(x: &Tensor) -> Result<Tensor, OCRError> {
-    let d = x.dim(D::Minus1).map_err(|e| {
-        candle_to_ocr_processing(
-            oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
-            "GLM-OCR: vision rotate_half dim",
-            e,
-        )
-    })?;
-    let half = d / 2;
-    let x1 = x.narrow(D::Minus1, 0, half).map_err(|e| {
-        candle_to_ocr_processing(
-            oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
-            "GLM-OCR: vision rotate_half narrow x1",
-            e,
-        )
-    })?;
-    let x2 = x.narrow(D::Minus1, half, half).map_err(|e| {
-        candle_to_ocr_processing(
-            oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
-            "GLM-OCR: vision rotate_half narrow x2",
-            e,
-        )
-    })?;
-    let nx2 = x2.neg().map_err(|e| {
-        candle_to_ocr_processing(
-            oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
-            "GLM-OCR: vision rotate_half neg",
-            e,
-        )
-    })?;
-    Tensor::cat(&[&nx2, &x1], D::Minus1).map_err(|e| {
-        candle_to_ocr_processing(
-            oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
-            "GLM-OCR: vision rotate_half cat",
-            e,
-        )
-    })
 }
 
 #[derive(Debug, Clone)]

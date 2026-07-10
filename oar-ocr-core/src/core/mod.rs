@@ -14,6 +14,8 @@
 pub mod batch;
 pub mod config;
 pub mod constants;
+#[cfg(feature = "auto-download")]
+pub mod download;
 pub mod errors;
 pub mod image_reader;
 pub mod inference;
@@ -22,10 +24,6 @@ pub mod macros;
 pub mod traits;
 pub mod validation;
 
-// Image utilities are now available directly from oar_ocr::utils
-// pub use crate::utils::{
-//     create_rgb_image, dynamic_to_gray, dynamic_to_rgb, load_image, load_images,
-// };
 pub use crate::domain::{
     IntoOwnedPrediction, IntoPrediction, OrientationResult, OwnedPredictionResult,
     PredictionResult, apply_document_orientation, apply_text_line_orientation,
@@ -45,7 +43,7 @@ pub use config::{
 pub use constants::*;
 pub use errors::{OCRError, OcrResult, OpaqueError, ProcessingStage};
 pub use image_reader::DefaultImageReader;
-pub use inference::{OrtInfer, TensorInput, TensorOutput, load_session};
+pub use inference::{ModelSource, OrtInfer, TensorInput, TensorOutput, load_session};
 pub use traits::{
     AdapterBuilder, AdapterInfo, AdapterTask, GranularImageReader, ImageReader, ImageTaskInput,
     ModelAdapter, Postprocessor, Preprocessor, Sampler, Task, TaskRunner, TaskSchema, TaskType,
@@ -57,5 +55,3 @@ pub use validation::{
     validate_normalization_params, validate_positive, validate_range, validate_same_length,
     validate_tensor_shape,
 };
-
-// init_tracing function has been moved to oar_ocr::utils::init_tracing

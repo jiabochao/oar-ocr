@@ -7,7 +7,6 @@ use crate::TaskPredictorBuilder;
 use crate::core::OcrResult;
 use crate::core::errors::OCRError;
 use crate::core::traits::OrtConfigurable;
-use crate::core::traits::adapter::AdapterBuilder;
 use crate::core::traits::task::ImageTaskInput;
 use crate::domain::adapters::{TableCellDetectionAdapterBuilder, TableCellModelConfig};
 use crate::domain::tasks::table_cell_detection::{
@@ -125,18 +124,25 @@ impl TableCellDetectionPredictorBuilder {
         self
     }
 
-    pub fn build<P: AsRef<Path>>(self, model_path: P) -> OcrResult<TableCellDetectionPredictor> {
+    pub fn build(
+        self,
+        model_source: impl Into<crate::core::ModelSource>,
+    ) -> OcrResult<TableCellDetectionPredictor> {
         let (config, ort_config) = self.state.into_parts();
-        let path_ref = model_path.as_ref();
+        let model_source = model_source.into();
         let variant = self
             .model_variant
-            .or_else(|| TableCellModelVariant::detect_from_path(path_ref))
+            .or_else(|| {
+                model_source
+                    .as_path()
+                    .and_then(TableCellModelVariant::detect_from_path)
+            })
             .ok_or_else(|| OCRError::ConfigError {
                 message: format!(
                     "Unable to determine table cell model variant from '{}'. \
                          Provide `model_variant(...)` on the builder or use a filename \
                          containing 'wired_table_cell' or 'wireless_table_cell'.",
-                    path_ref.display()
+                    model_source.display_path().display()
                 ),
             })?;
 
@@ -148,7 +154,7 @@ impl TableCellDetectionPredictorBuilder {
             adapter_builder = adapter_builder.with_ort_config(ort_cfg);
         }
 
-        let adapter = Box::new(adapter_builder.build(path_ref)?);
+        let adapter = super::build_adapter(adapter_builder, model_source)?;
         let task = TableCellDetectionTask::new(config.clone());
         Ok(TableCellDetectionPredictor {
             core: TaskPredictorCore::new(adapter, task, config),

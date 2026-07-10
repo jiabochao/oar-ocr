@@ -226,62 +226,6 @@ impl UVDocPostProcess {
         coords.iter().map(|&coord| coord.round() as i32).collect()
     }
 
-    /// Processes transformation matrix values.
-    ///
-    /// # Arguments
-    ///
-    /// * `matrix` - 3x3 transformation matrix as a flat vector.
-    ///
-    /// # Returns
-    ///
-    /// * `Vec<f32>` - Processed transformation matrix.
-    pub fn process_transformation_matrix(&self, matrix: &[f32; 9]) -> [f32; 9] {
-        // Apply scale to translation components (indices 2 and 5)
-        let mut processed = *matrix;
-        processed[2] *= self.scale; // tx
-        processed[5] *= self.scale; // ty
-        processed
-    }
-
-    /// Applies inverse transformation to coordinates.
-    ///
-    /// # Arguments
-    ///
-    /// * `coords` - Vector of coordinates to transform.
-    /// * `matrix` - 3x3 transformation matrix.
-    ///
-    /// # Returns
-    ///
-    /// * `OcrResult<Vec<[f32; 2]>>` - Transformed coordinates or error.
-    pub fn apply_inverse_transform(
-        &self,
-        coords: &[[f32; 2]],
-        matrix: &[f32; 9],
-    ) -> OcrResult<Vec<[f32; 2]>> {
-        // Calculate determinant for matrix inversion
-        let det = matrix[0] * (matrix[4] * matrix[8] - matrix[5] * matrix[7])
-            - matrix[1] * (matrix[3] * matrix[8] - matrix[5] * matrix[6])
-            + matrix[2] * (matrix[3] * matrix[7] - matrix[4] * matrix[6]);
-
-        if det.abs() < f32::EPSILON {
-            return Err(OCRError::InvalidInput {
-                message: "Matrix is not invertible (determinant is zero)".to_string(),
-            });
-        }
-
-        // For simplicity, this is a basic implementation
-        // In practice, you might want to use a proper matrix library
-        let mut transformed = Vec::new();
-        for &[x, y] in coords {
-            // Apply inverse transformation (simplified)
-            let new_x = (x - matrix[2]) / matrix[0];
-            let new_y = (y - matrix[5]) / matrix[4];
-            transformed.push([new_x, new_y]);
-        }
-
-        Ok(transformed)
-    }
-
     /// Applies batch processing to tensor output to produce rectified images.
     ///
     /// # Arguments
@@ -315,18 +259,36 @@ impl UVDocPostProcess {
         let mut images = Vec::with_capacity(batch_size);
 
         let scale = self.scale;
+        let plane = height * width;
 
         for b in 0..batch_size {
             let mut img = RgbImage::new(width as u32, height as u32);
 
-            for y in 0..height {
-                for x in 0..width {
-                    // Model outputs are in BGR order; convert back to RGB.
-                    let b_val = (output[[b, 0, y, x]] * scale).clamp(0.0, 255.0) as u8;
-                    let g_val = (output[[b, 1, y, x]] * scale).clamp(0.0, 255.0) as u8;
-                    let r_val = (output[[b, 2, y, x]] * scale).clamp(0.0, 255.0) as u8;
-
-                    img.put_pixel(x as u32, y as u32, Rgb([r_val, g_val, b_val]));
+            // Model outputs are in BGR order; convert back to RGB. For the
+            // common standard-layout tensor the three channel planes are
+            // contiguous, so the SIMD kernel scales + clamps them straight into
+            // the image buffer (no per-pixel `put_pixel`/strided indexing).
+            // Fall back to indexed access for non-standard layouts.
+            match output.as_slice() {
+                Some(buf) => {
+                    let base = b * 3 * plane;
+                    crate::processors::simd::scale_clamp_bgr_planes_to_rgb(
+                        &buf[base..base + plane],
+                        &buf[base + plane..base + 2 * plane],
+                        &buf[base + 2 * plane..base + 3 * plane],
+                        scale,
+                        img.as_mut(),
+                    );
+                }
+                None => {
+                    for y in 0..height {
+                        for x in 0..width {
+                            let b_val = (output[[b, 0, y, x]] * scale).clamp(0.0, 255.0) as u8;
+                            let g_val = (output[[b, 1, y, x]] * scale).clamp(0.0, 255.0) as u8;
+                            let r_val = (output[[b, 2, y, x]] * scale).clamp(0.0, 255.0) as u8;
+                            img.put_pixel(x as u32, y as u32, Rgb([r_val, g_val, b_val]));
+                        }
+                    }
                 }
             }
 

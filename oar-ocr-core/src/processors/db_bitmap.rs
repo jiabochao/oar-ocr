@@ -1,6 +1,10 @@
 use crate::processors::geometry::{BoundingBox, MinAreaRect, Point};
 use crate::processors::types::ScoreMode;
-use clipper2::{EndType, JoinType, Path as ClipperPath};
+use clipper2_rust::{
+    clipper::inflate_paths_d,
+    core::{PathD, PathsD, PointD, area},
+    offset::{EndType, JoinType},
+};
 use image::GrayImage;
 use imageproc::contours::{Contour, find_contours};
 use std::cmp::Ordering;
@@ -22,12 +26,15 @@ impl DBPostProcess {
         let width = bitmap.width() as usize;
         let width_scale = dest_width as f32 / width as f32;
         let height_scale = dest_height as f32 / height as f32;
+        let dest_w_f = dest_width as f32;
+        let dest_h_f = dest_height as f32;
 
         let contours = find_contours::<u32>(bitmap);
-        let mut boxes = Vec::new();
-        let mut scores = Vec::new();
+        let max_candidates = self.max_candidates;
+        let mut boxes: Vec<BoundingBox> = Vec::with_capacity(contours.len().min(max_candidates));
+        let mut scores: Vec<f32> = Vec::with_capacity(boxes.capacity());
 
-        for contour in contours.into_iter().take(self.max_candidates) {
+        for contour in contours.into_iter().take(max_candidates) {
             if contour.points.len() < 4 {
                 continue;
             }
@@ -45,11 +52,7 @@ impl DBPostProcess {
                 continue;
             }
 
-            let unclipped = if approx.points.len() > 2 {
-                self.unclip(&approx, unclip_ratio)
-            } else {
-                continue;
-            };
+            let unclipped = self.unclip(&approx, unclip_ratio);
             if unclipped.points.is_empty() {
                 continue;
             }
@@ -61,19 +64,15 @@ impl DBPostProcess {
                 continue;
             }
 
-            let scaled_points: Vec<Point> = unclipped
-                .points
-                .iter()
-                .map(|point| {
-                    let x = (point.x * width_scale)
-                        .round()
-                        .clamp(0.0, dest_width as f32);
-                    let y = (point.y * height_scale)
-                        .round()
-                        .clamp(0.0, dest_height as f32);
-                    Point::new(x, y)
-                })
-                .collect();
+            // Scale unclipped points back to the original image coords
+            // in a single pass with pre-allocated capacity.
+            let n = unclipped.points.len();
+            let mut scaled_points: Vec<Point> = Vec::with_capacity(n);
+            for point in &unclipped.points {
+                let x = (point.x * width_scale).round().clamp(0.0, dest_w_f);
+                let y = (point.y * height_scale).round().clamp(0.0, dest_h_f);
+                scaled_points.push(Point::new(x, y));
+            }
 
             boxes.push(BoundingBox::new(scaled_points));
             scores.push(score);
@@ -95,12 +94,15 @@ impl DBPostProcess {
         let width = bitmap.width() as usize;
         let width_scale = dest_width as f32 / width as f32;
         let height_scale = dest_height as f32 / height as f32;
+        let dest_w_f = dest_width as f32;
+        let dest_h_f = dest_height as f32;
 
         let contours = find_contours::<u32>(bitmap);
-        let mut boxes = Vec::new();
-        let mut scores = Vec::new();
+        let max_candidates = self.max_candidates;
+        let mut boxes: Vec<BoundingBox> = Vec::with_capacity(contours.len().min(max_candidates));
+        let mut scores: Vec<f32> = Vec::with_capacity(boxes.capacity());
 
-        for contour in contours.into_iter().take(self.max_candidates) {
+        for contour in contours.into_iter().take(max_candidates) {
             let Some((mini_box_points, min_side)) = self.get_mini_boxes_from_contour(&contour)
             else {
                 continue;
@@ -132,18 +134,13 @@ impl DBPostProcess {
                 continue;
             }
 
-            let scaled_points: Vec<Point> = box_points
-                .iter()
-                .map(|point| {
-                    let x = (point.x * width_scale)
-                        .round()
-                        .clamp(0.0, dest_width as f32);
-                    let y = (point.y * height_scale)
-                        .round()
-                        .clamp(0.0, dest_height as f32);
-                    Point::new(x, y)
-                })
-                .collect();
+            let n = box_points.len();
+            let mut scaled_points: Vec<Point> = Vec::with_capacity(n);
+            for point in &box_points {
+                let x = (point.x * width_scale).round().clamp(0.0, dest_w_f);
+                let y = (point.y * height_scale).round().clamp(0.0, dest_h_f);
+                scaled_points.push(Point::new(x, y));
+            }
 
             boxes.push(BoundingBox::new(scaled_points));
             scores.push(score);
@@ -173,7 +170,7 @@ impl DBPostProcess {
             return None;
         }
 
-        let min_rect = BoundingBox::new(points.to_vec()).get_min_area_rect();
+        let min_rect = BoundingBox::get_min_area_rect_from_points(points);
         let min_side = min_rect.min_side();
         if !min_side.is_finite() || min_side <= 0.0 {
             return None;
@@ -284,42 +281,63 @@ impl DBPostProcess {
             return bbox.clone();
         }
 
-        let clipper_path: ClipperPath = bbox
+        let clipper_path: PathD = bbox
             .points
             .iter()
-            .map(|point| (point.x as f64, point.y as f64))
-            .collect::<Vec<_>>()
-            .into();
+            .map(|point| PointD {
+                x: point.x as f64,
+                y: point.y as f64,
+            })
+            .collect();
 
         if clipper_path.len() < 3 {
             return BoundingBox::new(Vec::new());
         }
 
-        let area = clipper_path.signed_area().abs();
-        if area <= f64::EPSILON {
+        let polygon_area = area(&clipper_path).abs();
+        if polygon_area <= f64::EPSILON {
             return BoundingBox::new(Vec::new());
         }
 
-        let coords: Vec<(f64, f64)> = clipper_path.iter().map(|p| (p.x(), p.y())).collect();
+        // Sum the perimeter as a manual wrap-around loop to avoid the
+        // `zip(cycle().skip(1))` allocation pattern (which clones the
+        // iterator to advance the cycle by one).
         let mut perimeter = 0.0f64;
-        for i in 0..coords.len() {
-            let (x1, y1) = coords[i];
-            let (x2, y2) = coords[(i + 1) % coords.len()];
-            let dx = x2 - x1;
-            let dy = y2 - y1;
-            perimeter += (dx * dx + dy * dy).sqrt();
+        let n = clipper_path.len();
+        if n >= 2 {
+            // Walk consecutive edges, then close the loop separately, so the
+            // hot inner loop avoids a `%` per iteration.
+            let mut p1 = &clipper_path[0];
+            for p2 in &clipper_path[1..] {
+                perimeter += (p2.x - p1.x).hypot(p2.y - p1.y);
+                p1 = p2;
+            }
+            let first = &clipper_path[0];
+            perimeter += (first.x - p1.x).hypot(first.y - p1.y);
         }
 
         if perimeter <= f64::EPSILON {
             return BoundingBox::new(Vec::new());
         }
 
-        let delta = area * unclip_ratio as f64 / perimeter;
+        let delta = polygon_area * unclip_ratio as f64 / perimeter;
         if delta.abs() <= f64::EPSILON {
             return BoundingBox::new(Vec::new());
         }
 
-        let offset_paths = clipper_path.inflate(delta, JoinType::Round, EndType::Polygon, 2.0);
+        // `precision = 2` and `arc_tolerance = 0.0` match Clipper2's PathsD
+        // defaults: two decimal places of internal fixed-point precision
+        // (the C++ default) and an arc-tolerance derived from `delta`.
+        let paths: PathsD = vec![clipper_path];
+        let offset_paths = inflate_paths_d(
+            &paths,
+            delta,
+            JoinType::Round,
+            EndType::Polygon,
+            2.0,
+            2,
+            0.0,
+        );
 
         if offset_paths.len() != 1 {
             return BoundingBox::new(Vec::new());
@@ -330,18 +348,16 @@ impl DBPostProcess {
 
         let mut points: Vec<Point> = path
             .iter()
-            .map(|pt| Point::new(pt.x() as f32, pt.y() as f32))
+            .map(|pt| Point::new(pt.x as f32, pt.y as f32))
             .collect();
 
         // Remove duplicate closing point if present
-        if points.len() > 1 {
-            // Safe: we just verified len() > 1
-            if let (Some(first), Some(last)) = (points.first(), points.last())
-                && (first.x - last.x).abs() < f32::EPSILON
-                && (first.y - last.y).abs() < f32::EPSILON
-            {
-                points.pop();
-            }
+        if points.len() > 1
+            && let (Some(first), Some(last)) = (points.first(), points.last())
+            && (first.x - last.x).abs() < f32::EPSILON
+            && (first.y - last.y).abs() < f32::EPSILON
+        {
+            points.pop();
         }
 
         if points.len() < 3 {

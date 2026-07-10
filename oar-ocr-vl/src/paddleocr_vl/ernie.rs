@@ -2,9 +2,10 @@ use super::config::PaddleOcrVlConfig;
 use crate::attention::{
     RotaryEmbedding, repeat_kv, scaled_dot_product_attention, select_rope_sections,
 };
+use crate::kv_trim::TrimmableKvCache;
 use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing, rotate_half};
 use candle_core::Tensor;
-use candle_nn::{Module, kv_cache::KvCache};
+use candle_nn::Module;
 use oar_ocr_core::core::OCRError;
 use std::cell::RefCell;
 
@@ -134,7 +135,7 @@ struct Ernie4_5Attention {
     head_dim: usize,
     scaling: f64,
     mrope_section: Vec<usize>,
-    kv_cache: RefCell<KvCache>,
+    kv_cache: RefCell<TrimmableKvCache>,
 }
 
 impl Ernie4_5Attention {
@@ -180,13 +181,10 @@ impl Ernie4_5Attention {
             });
         }
 
-        // Create KvCache with dim=2 for seq_len dimension, use 8192 as reasonable max length
-        // Create KvCache with dim=2 for seq_len dimension
-        // Pre-allocate enough space to avoid O(N) reallocation during generation
-        // Conservative estimate: vision tokens + max_generation_tokens
-        // Typical: ~1000-2000 vision tokens + 4096 generation tokens = ~6000-8000 total
-        // Use 16384 to handle worst case without reallocation
-        let kv_cache = KvCache::new(2, 16384);
+        // Trim/gather-capable KV cache, dim=2 for the seq_len axis.
+        // Pre-allocate 16384 (vision + generation tokens) to avoid
+        // reallocation during generation.
+        let kv_cache = TrimmableKvCache::new(2, 16384);
 
         Ok(Self {
             q_proj,

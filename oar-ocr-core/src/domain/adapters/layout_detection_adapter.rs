@@ -20,7 +20,6 @@ use crate::models::detection::{
 use crate::processors::{ImageScaleInfo, LayoutPostProcess, apply_nms_with_merge, unclip_boxes};
 use ndarray::Axis;
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Result data for layout detection box filtering and merging operations.
 ///
@@ -1231,7 +1230,7 @@ impl LayoutDetectionAdapterBuilder {
     /// Builds the adapter with the specified model configuration.
     fn build_with_config(
         self,
-        model_path: &Path,
+        model_source: crate::core::ModelSource,
         model_config: LayoutModelConfig,
     ) -> Result<LayoutDetectionAdapter, OCRError> {
         let (task_config, ort_config) =
@@ -1252,16 +1251,16 @@ impl LayoutDetectionAdapterBuilder {
                 ort_session: ort_config,
                 ..Default::default()
             };
-            OrtInfer::from_config(&common_config, model_path, input_name)?
+            OrtInfer::from_config(&common_config, model_source, input_name)?
         } else {
             match model_config.model_type.as_str() {
                 "pp-doclayout" => {
                     // PP-DocLayout models use "image" as the input name
-                    OrtInfer::new(model_path, Some("image"))?
+                    OrtInfer::new(model_source, Some("image"))?
                 }
                 _ => {
                     // Other models use default or auto-detect
-                    OrtInfer::new(model_path, None)?
+                    OrtInfer::new(model_source, None)?
                 }
             }
         };
@@ -1344,7 +1343,10 @@ impl AdapterBuilder for LayoutDetectionAdapterBuilder {
     type Config = LayoutDetectionConfig;
     type Adapter = LayoutDetectionAdapter;
 
-    fn build(self, model_path: &Path) -> Result<Self::Adapter, OCRError> {
+    fn build(
+        self,
+        model_source: impl Into<crate::core::ModelSource>,
+    ) -> Result<Self::Adapter, OCRError> {
         let model_config = self
             .model_config
             .clone()
@@ -1352,7 +1354,7 @@ impl AdapterBuilder for LayoutDetectionAdapterBuilder {
                 message: "Model configuration is required".to_string(),
             })?;
 
-        self.build_with_config(model_path, model_config)
+        self.build_with_config(model_source.into(), model_config)
     }
 
     fn with_config(mut self, config: Self::Config) -> Self {
@@ -1435,8 +1437,11 @@ impl AdapterBuilder for PicoDetLayoutAdapterBuilder {
     type Config = LayoutDetectionConfig;
     type Adapter = PicoDetLayoutAdapter;
 
-    fn build(self, model_path: &Path) -> Result<Self::Adapter, OCRError> {
-        self.inner.build(model_path)
+    fn build(
+        self,
+        model_source: impl Into<crate::core::ModelSource>,
+    ) -> Result<Self::Adapter, OCRError> {
+        self.inner.build(model_source)
     }
 
     fn with_config(mut self, config: Self::Config) -> Self {
@@ -1510,8 +1515,11 @@ impl AdapterBuilder for RTDetrLayoutAdapterBuilder {
     type Config = LayoutDetectionConfig;
     type Adapter = RTDetrLayoutAdapter;
 
-    fn build(self, model_path: &Path) -> Result<Self::Adapter, OCRError> {
-        self.inner.build(model_path)
+    fn build(
+        self,
+        model_source: impl Into<crate::core::ModelSource>,
+    ) -> Result<Self::Adapter, OCRError> {
+        self.inner.build(model_source)
     }
 
     fn with_config(mut self, config: Self::Config) -> Self {
@@ -1546,14 +1554,15 @@ impl PPDocLayoutAdapterBuilder {
     ///
     /// # Arguments
     ///
-    /// * `model_name` - Model variant name. Supported values:
-    ///   - `"pp-doclayout-s"` or `"pp_doclayout_s"` - Small model (480x480)
-    ///   - `"pp-doclayout-m"` or `"pp_doclayout_m"` - Medium model (640x640)
-    ///   - `"pp-doclayout-l"` or `"pp_doclayout_l"` - Large model (640x640, default)
-    ///   - `"pp-doclayout_plus-l"` or `"pp_doclayout_plus_l"` - Plus-Large model (800x800)
-    ///   - `"pp-doclayoutv2"` or `"pp_doclayoutv2"` - PP-DocLayoutV2 model (800x800)
-    ///   - `"pp-doclayoutv3"` or `"pp_doclayoutv3"` - PP-DocLayoutV3 model (800x800)
-    ///   - `"pp-docblocklayout"` or `"pp_docblocklayout"` - Block layout model (640x640)
+    /// * `model_name` - Model variant name. Supported values (any other value
+    ///   falls back to `"PP-DocLayout-L"`):
+    ///   - `"PP-DocLayout-S"` - Small model (480x480)
+    ///   - `"PP-DocLayout-M"` - Medium model (640x640)
+    ///   - `"PP-DocLayout-L"` - Large model (640x640, default)
+    ///   - `"PP-DocLayout_plus-L"` - Plus-Large model (800x800)
+    ///   - `"PP-DocLayoutV2"` / `"PP-DocLayout-V2"` - PP-DocLayoutV2 model (800x800)
+    ///   - `"PP-DocLayoutV3"` / `"PP-DocLayout-V3"` - PP-DocLayoutV3 model (800x800)
+    ///   - `"PP-DocBlockLayout"` - Block layout model (640x640)
     ///
     /// # Example
     ///
@@ -1563,7 +1572,7 @@ impl PPDocLayoutAdapterBuilder {
     /// use oar_ocr_core::domain::adapters::PPDocLayoutAdapterBuilder;
     ///
     /// # fn main() -> Result<(), oar_ocr_core::core::OCRError> {
-    /// let _adapter = PPDocLayoutAdapterBuilder::new("pp-doclayout-s")
+    /// let _adapter = PPDocLayoutAdapterBuilder::new("PP-DocLayout-S")
     ///     .build(Path::new("model.onnx"))?;
     /// # Ok(())
     /// # }
@@ -1619,8 +1628,11 @@ impl AdapterBuilder for PPDocLayoutAdapterBuilder {
     type Config = LayoutDetectionConfig;
     type Adapter = PPDocLayoutAdapter;
 
-    fn build(self, model_path: &Path) -> Result<Self::Adapter, OCRError> {
-        self.inner.build(model_path)
+    fn build(
+        self,
+        model_source: impl Into<crate::core::ModelSource>,
+    ) -> Result<Self::Adapter, OCRError> {
+        self.inner.build(model_source)
     }
 
     fn with_config(mut self, config: Self::Config) -> Self {

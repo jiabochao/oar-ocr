@@ -13,17 +13,16 @@ use std::sync::LazyLock;
 // Static regex patterns for LaTeX normalization
 static CHINESE_TEXT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\\text\s*\{([^{}]*[\u{4e00}-\u{9fff}]+[^{}]*)\}")
-        .unwrap_or_else(|e| panic!("Failed to compile Chinese text regex pattern: {e}"))
+        .expect("static regex: Chinese text pattern")
 });
 
 static TEXT_COMMAND_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(\\(operatorname|mathrm|text|mathbf)\s?\*?\s*\{.*?\})")
-        .unwrap_or_else(|e| panic!("Failed to compile text command regex pattern: {e}"))
+        .expect("static regex: text command pattern")
 });
 
 static LETTER_TO_NONLETTER_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"([a-zA-Z])\s+([^a-zA-Z])")
-        .unwrap_or_else(|e| panic!("Failed to compile letter to nonletter regex pattern: {e}"))
+    Regex::new(r"([a-zA-Z])\s+([^a-zA-Z])").expect("static regex: letter to nonletter pattern")
 });
 
 /// Configuration parameters for formula preprocessing pipeline.
@@ -41,13 +40,8 @@ pub struct FormulaPreprocessParams {
     pub normalize_std: [f32; 3],
 }
 
-/// Preprocessor implementing the standard formula recognition pipeline.
-///
-/// This preprocessor applies the following transformations:
-/// 1. Margin cropping - removes background margins by binarization
-/// 2. Resize and padding - scales image to target size with aspect ratio preservation
-/// 3. Normalization and grayscale conversion - normalizes pixel values and converts to grayscale
-/// 4. Tensor formatting - converts to 4D tensor with proper padding alignment
+/// Formula recognition preprocessor: margin crop → resize-and-pad →
+/// normalize-and-grayscale → 4D tensor formatting.
 #[derive(Debug, Clone)]
 pub struct FormulaPreprocessor {
     params: FormulaPreprocessParams,
@@ -79,14 +73,8 @@ impl FormulaPreprocessor {
         self.format_to_tensor(normalized)
     }
 
-    /// Removes background margins by binarization and cropping.
-    ///
-    /// The algorithm:
-    /// 1. Converts to grayscale
-    /// 2. Normalizes pixel values to 0-255 range
-    /// 3. Binarizes using the configured threshold
-    /// 4. Finds bounding box of foreground pixels
-    /// 5. Crops to the bounding box
+    /// Removes background margins: binarizes (grayscale, normalized, thresholded)
+    /// and crops to the foreground bounding box.
     fn crop_margin(&self, img: &RgbImage) -> RgbImage {
         let gray = DynamicImage::ImageRgb8(img.clone()).to_luma8();
         let (width, height) = gray.dimensions();
@@ -146,12 +134,8 @@ impl FormulaPreprocessor {
             .to_image()
     }
 
-    /// Resizes image to target size while preserving aspect ratio, then pads with black.
-    ///
-    /// The resize strategy:
-    /// 1. Calculates scale factor based on the smaller dimension of target size
-    /// 2. Resizes maintaining aspect ratio
-    /// 3. Centers the resized image on black background of target size
+    /// Resizes to fit the target size (preserving aspect ratio) and centers the
+    /// result on a black background.
     fn resize_and_pad(&self, img: &RgbImage) -> RgbImage {
         let (target_width, target_height) = self.params.target_size;
         let (img_width, img_height) = img.dimensions();
@@ -184,12 +168,9 @@ impl FormulaPreprocessor {
         padded
     }
 
-    /// Normalizes pixel values and converts to grayscale representation.
-    ///
-    /// The normalization follows UniMERNet's preprocessing:
-    /// 1. Normalizes RGB channels using mean and std (in BGR order for OpenCV compatibility)
-    /// 2. Converts to grayscale using standard weights (0.299*R + 0.587*G + 0.114*B)
-    /// 3. Replicates grayscale to 3 channels for model input
+    /// Normalizes and converts to grayscale, following UniMERNet's preprocessing:
+    /// per-channel normalize (BGR order, for OpenCV compatibility), luminance
+    /// grayscale (0.299R + 0.587G + 0.114B), then replicate to 3 channels.
     fn normalize_and_to_grayscale(&self, img: &RgbImage) -> Array3<f32> {
         let (width, height) = img.dimensions();
 
@@ -326,22 +307,25 @@ pub fn normalize_latex(latex: &str) -> String {
         prev_result = result.clone();
 
         // Python pattern 1: r"(?!\\ )(%s)\s+?(%s)" % (noletter, noletter)
-        // This removes spaces between two non-letters unless preceded by backslash-space
-        // We need to be careful not to remove spaces after \\
+        // In Python's raw regex, `\\ ` matches a literal `\` followed by space —
+        // i.e. the LaTeX thin-space token `\ `. The negative lookahead therefore
+        // refuses to match `(noletter)` when it would start with `\ `, leaving
+        // LaTeX thin spaces untouched. The earlier Rust port checked for `\\ `
+        // (two literal backslashes + space, i.e. LaTeX line break) which is the
+        // wrong token; that bug let `\ \ ` collapse to `\\` and dropped both
+        // thin spaces.
         let mut temp = String::new();
         let chars: Vec<char> = result.chars().collect();
         let mut i = 0;
         while i < chars.len() {
-            if i + 2 < chars.len()
-                && chars[i] == '\\'
-                && chars[i + 1] == '\\'
-                && chars[i + 2] == ' '
-            {
-                // Keep "\\ " as is
+            if i + 1 < chars.len() && chars[i] == '\\' && chars[i + 1] == ' ' {
+                // Python's lookahead refuses to *start* a match at this `\`,
+                // but the following space is still a normal-space candidate for
+                // matches that begin at the next character. Mirror that by only
+                // emitting the backslash here and letting the next iteration
+                // decide what to do with the space.
                 temp.push(chars[i]);
-                temp.push(chars[i + 1]);
-                temp.push(chars[i + 2]);
-                i += 3;
+                i += 1;
             } else if i + 1 < chars.len() && chars[i + 1].is_whitespace() {
                 // Check if current char is noletter
                 let is_noletter_current = !chars[i].is_ascii_alphabetic();

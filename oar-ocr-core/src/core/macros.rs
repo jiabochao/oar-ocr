@@ -147,7 +147,7 @@ macro_rules! impl_task_type_enum {
 /// Macro to handle optional nested config initialization in builders.
 ///
 /// This macro eliminates the repeated pattern of:
-/// ```rust,no_run
+/// ```text
 /// // if self.config.field.is_none() {
 /// //     self.config.field = Some(Type::new());
 /// // }
@@ -155,7 +155,7 @@ macro_rules! impl_task_type_enum {
 ///
 /// # Usage
 ///
-/// ```rust,no_run
+/// ```text
 /// // Instead of:
 /// // if self.config.orientation.is_none() {
 /// //     self.config.orientation = Some(DocOrientationClassifierConfig::new());
@@ -187,7 +187,7 @@ macro_rules! with_nested {
 ///
 /// # Usage
 ///
-/// ```rust,no_run
+/// ```text
 /// // Instead of:
 /// // StageMetrics::new(success_count, failure_count)
 /// //     .with_processing_time(start_time.elapsed())
@@ -235,7 +235,7 @@ macro_rules! metrics {
 ///
 /// # Usage
 ///
-/// ```rust,no_run
+/// ```text
 /// // impl_complete_builder! {
 /// //     builder: MyBuilder,
 /// //     config_field: config,
@@ -605,9 +605,12 @@ macro_rules! impl_adapter_builder {
             type Config = $Config;
             type Adapter = $Adapter;
 
-            fn build(self, model_path: &std::path::Path) -> Result<Self::Adapter, $crate::core::OCRError> {
-                let build_fn: fn(Self, &std::path::Path) -> Result<$Adapter, $crate::core::OCRError> = $build_closure;
-                build_fn(self, model_path)
+            fn build(
+                self,
+                model_source: impl Into<$crate::core::ModelSource>,
+            ) -> Result<Self::Adapter, $crate::core::OCRError> {
+                let build_fn: fn(Self, $crate::core::ModelSource) -> Result<$Adapter, $crate::core::OCRError> = $build_closure;
+                build_fn(self, model_source.into())
             }
 
             fn with_config(mut self, config: Self::Config) -> Self {
@@ -763,9 +766,12 @@ macro_rules! impl_adapter_builder {
             type Config = $Config;
             type Adapter = $Adapter;
 
-            fn build(self, model_path: &std::path::Path) -> Result<Self::Adapter, $crate::core::OCRError> {
-                let build_fn: fn(Self, &std::path::Path) -> Result<$Adapter, $crate::core::OCRError> = $build_closure;
-                build_fn(self, model_path)
+            fn build(
+                self,
+                model_source: impl Into<$crate::core::ModelSource>,
+            ) -> Result<Self::Adapter, $crate::core::OCRError> {
+                let build_fn: fn(Self, $crate::core::ModelSource) -> Result<$Adapter, $crate::core::OCRError> = $build_closure;
+                build_fn(self, model_source.into())
             }
 
             fn with_config(self, config: Self::Config) -> Self {
@@ -827,9 +833,12 @@ macro_rules! impl_adapter_builder {
             type Config = $Config;
             type Adapter = $Adapter;
 
-            fn build(self, model_path: &std::path::Path) -> Result<Self::Adapter, $crate::core::OCRError> {
-                let build_fn: fn(Self, &std::path::Path) -> Result<$Adapter, $crate::core::OCRError> = $build_closure;
-                build_fn(self, model_path)
+            fn build(
+                self,
+                model_source: impl Into<$crate::core::ModelSource>,
+            ) -> Result<Self::Adapter, $crate::core::OCRError> {
+                let build_fn: fn(Self, $crate::core::ModelSource) -> Result<$Adapter, $crate::core::OCRError> = $build_closure;
+                build_fn(self, model_source.into())
             }
 
             fn with_config(self, config: Self::Config) -> Self {
@@ -847,7 +856,7 @@ macro_rules! impl_adapter_builder {
 /// Macro to conditionally apply OrtSessionConfig to any builder that has `with_ort_config`.
 ///
 /// This macro eliminates the repeated pattern:
-/// ```rust,no_run
+/// ```text
 /// // let mut builder = SomeBuilder::new();
 /// // if let Some(ort_config) = ort_config {
 /// //     builder = builder.with_ort_config(ort_config);
@@ -855,13 +864,13 @@ macro_rules! impl_adapter_builder {
 /// ```
 ///
 /// Instead, use:
-/// ```rust,no_run
+/// ```text
 /// // let builder = apply_ort_config!(SomeBuilder::new(), ort_config);
 /// ```
 ///
 /// # Usage
 ///
-/// ```rust,no_run
+/// ```text
 /// // Works with any builder that has a `with_ort_config` method:
 /// // let builder = apply_ort_config!(
 /// //     DBModelBuilder::new()

@@ -6,6 +6,7 @@
 use crate::domain::tasks::MergeBboxMode;
 use crate::processors::{BoundingBox, ImageScaleInfo, Point};
 use ndarray::{ArrayView3, Axis};
+use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -62,24 +63,33 @@ impl LayoutPostProcess {
         img_shapes: Vec<ImageScaleInfo>,
     ) -> LayoutPostprocessOutput {
         let batch_size = predictions.shape()[0];
-        let mut all_boxes = Vec::with_capacity(batch_size);
-        let mut all_classes = Vec::with_capacity(batch_size);
-        let mut all_scores = Vec::with_capacity(batch_size);
+        let n = batch_size.min(img_shapes.len());
 
-        // Process each image in batch
-        for (batch_idx, img_shape) in img_shapes.into_iter().enumerate().take(batch_size) {
-            let pred = predictions.index_axis(Axis(0), batch_idx);
+        // Each batch entry is independent; the postprocess loop
+        // (parsing, NMS, score thresholding) is dominated by CPU work, so
+        // we fan it out across cores. The threads only read shared state
+        // (model_type strings, thresholds) which is immutable.
+        let per_image: Vec<(Vec<BoundingBox>, Vec<usize>, Vec<f32>)> = (0..n)
+            .into_par_iter()
+            .map(|batch_idx| {
+                let img_shape = &img_shapes[batch_idx];
+                let pred = predictions.index_axis(Axis(0), batch_idx);
+                match self.model_type.as_str() {
+                    "picodet" => self.process_picodet(pred, img_shape),
+                    "rtdetr" => self.process_rtdetr(pred, img_shape),
+                    "pp-doclayout" => self.process_pp_doclayout(pred, img_shape),
+                    _ => self.process_standard(pred, img_shape),
+                }
+            })
+            .collect();
 
-            let (boxes, classes, scores) = match self.model_type.as_str() {
-                "picodet" => self.process_picodet(pred, &img_shape),
-                "rtdetr" => self.process_rtdetr(pred, &img_shape),
-                "pp-doclayout" => self.process_pp_doclayout(pred, &img_shape),
-                _ => self.process_standard(pred, &img_shape),
-            };
-
-            all_boxes.push(boxes);
-            all_classes.push(classes);
-            all_scores.push(scores);
+        let mut all_boxes = Vec::with_capacity(n);
+        let mut all_classes = Vec::with_capacity(n);
+        let mut all_scores = Vec::with_capacity(n);
+        for (b, c, s) in per_image {
+            all_boxes.push(b);
+            all_classes.push(c);
+            all_scores.push(s);
         }
 
         (all_boxes, all_classes, all_scores)
@@ -133,7 +143,7 @@ impl LayoutPostProcess {
             if feature_dim == 4 + self.num_classes {
                 // Format: [x1, y1, x2, y2, scores...]
                 let (max_class, max_score) = row[4..].iter().enumerate().fold(
-                    (0usize, 0.0f32),
+                    (0usize, f32::NEG_INFINITY),
                     |(best_cls, best_score), (cls_idx, &score)| {
                         if score > best_score {
                             (cls_idx, score)
@@ -227,13 +237,21 @@ impl LayoutPostProcess {
         // PP-DocLayout outputs in [num_boxes, 1, N] format
         // where N is 6 or 8 depending on model version
         let shape = predictions.shape();
-        let num_boxes = shape[0];
-        let feature_dim = shape[2];
 
         let mut boxes = Vec::new();
         let mut classes = Vec::new();
         let mut scores = Vec::new();
         let mut reading_orders: Vec<(f32, f32)> = Vec::new();
+
+        // Guard against unexpected/under-width model output before indexing
+        // `[box_idx, 0, 0..=5]` (and `..=7` for the 8-dim variant). Mirrors the
+        // shape validation in `process_picodet`.
+        if shape.len() != 3 || shape[1] == 0 || shape[2] < 6 {
+            return (boxes, classes, scores);
+        }
+
+        let num_boxes = shape[0];
+        let feature_dim = shape[2];
 
         let orig_width = img_shape.src_w;
         let orig_height = img_shape.src_h;
@@ -475,10 +493,15 @@ impl LayoutPostProcess {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // Precompute AABB bounds once (used by every IoU). This collapses
+        // the original 4 separate `fold` passes per box down to one pass.
+        let bounds: Vec<(f32, f32, f32, f32)> = boxes.iter().map(|b| b.aabb()).collect();
+
         let mut keep = Vec::new();
         let mut suppressed = vec![false; boxes.len()];
 
-        for &i in &indices {
+        for pos in 0..indices.len() {
+            let i = indices[pos];
             if suppressed[i] {
                 continue;
             }
@@ -488,10 +511,31 @@ impl LayoutPostProcess {
                 break;
             }
 
-            // Suppress boxes with high IoU
-            for &j in &indices {
-                if i != j && !suppressed[j] && classes[i] == classes[j] {
-                    let iou = self.calculate_iou(&boxes[i], &boxes[j]);
+            let (ix1, iy1, ix2, iy2) = bounds[i];
+            let ic = classes[i];
+            let area_i = (ix2 - ix1) * (iy2 - iy1);
+
+            // Suppress later boxes with high IoU against `i`. `indices` is sorted
+            // by descending score, so only boxes after `pos` can be suppressed by
+            // `i` (earlier ones were already processed). Uses precomputed AABB
+            // bounds and skips mismatched classes / already-suppressed boxes.
+            for &j in &indices[pos + 1..] {
+                if suppressed[j] || classes[j] != ic {
+                    continue;
+                }
+                let (jx1, jy1, jx2, jy2) = bounds[j];
+                let inter_x_min = ix1.max(jx1);
+                let inter_y_min = iy1.max(jy1);
+                let inter_x_max = ix2.min(jx2);
+                let inter_y_max = iy2.min(jy2);
+                if inter_x_min >= inter_x_max || inter_y_min >= inter_y_max {
+                    continue;
+                }
+                let inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min);
+                let area_j = (jx2 - jx1) * (jy2 - jy1);
+                let union_area = area_i + area_j - inter_area;
+                if union_area > 0.0 {
+                    let iou = inter_area / union_area;
                     if iou > self.nms_threshold {
                         suppressed[j] = true;
                     }
@@ -523,6 +567,7 @@ impl LayoutPostProcess {
     }
 
     /// Calculate Intersection over Union between two bounding boxes.
+    #[allow(dead_code)]
     fn calculate_iou(&self, box1: &BoundingBox, box2: &BoundingBox) -> f32 {
         // Get bounding rectangle for box1
         let (x1_min, y1_min, x1_max, y1_max) = self.get_bbox_bounds(box1);
@@ -553,6 +598,7 @@ impl LayoutPostProcess {
     }
 
     /// Get the minimum and maximum coordinates from a bounding box.
+    #[allow(dead_code)]
     fn get_bbox_bounds(&self, bbox: &BoundingBox) -> (f32, f32, f32, f32) {
         if bbox.points.is_empty() {
             return (0.0, 0.0, 0.0, 0.0);
@@ -608,27 +654,26 @@ pub fn unclip_boxes(
                 return bbox.clone();
             }
 
-            // Get current bounds
-            let x_min = bbox.x_min();
-            let y_min = bbox.y_min();
-            let x_max = bbox.x_max();
-            let y_max = bbox.y_max();
+            // Get current bounds in a single pass
+            let (x_min, y_min, x_max, y_max) = bbox.aabb();
 
             // Calculate center and dimensions
             let width = x_max - x_min;
             let height = y_max - y_min;
-            let center_x = x_min + width / 2.0;
-            let center_y = y_min + height / 2.0;
+            let center_x = x_min + width * 0.5;
+            let center_y = y_min + height * 0.5;
 
             // Apply ratio
             let new_width = width * w_ratio;
             let new_height = height * h_ratio;
+            let half_new_w = new_width * 0.5;
+            let half_new_h = new_height * 0.5;
 
             // Calculate new bounds
-            let new_x_min = center_x - new_width / 2.0;
-            let new_y_min = center_y - new_height / 2.0;
-            let new_x_max = center_x + new_width / 2.0;
-            let new_y_max = center_y + new_height / 2.0;
+            let new_x_min = center_x - half_new_w;
+            let new_y_min = center_y - half_new_h;
+            let new_x_max = center_x + half_new_w;
+            let new_y_max = center_y + half_new_h;
 
             BoundingBox::from_coords(new_x_min, new_y_min, new_x_max, new_y_max)
         })
@@ -645,8 +690,8 @@ pub fn unclip_boxes(
 /// # Returns
 /// Merged bounding box according to the mode
 pub fn merge_boxes(box1: &BoundingBox, box2: &BoundingBox, mode: MergeBboxMode) -> BoundingBox {
-    let (x1_min, y1_min, x1_max, y1_max) = (box1.x_min(), box1.y_min(), box1.x_max(), box1.y_max());
-    let (x2_min, y2_min, x2_max, y2_max) = (box2.x_min(), box2.y_min(), box2.x_max(), box2.y_max());
+    let (x1_min, y1_min, x1_max, y1_max) = box1.aabb();
+    let (x2_min, y2_min, x2_max, y2_max) = box2.aabb();
 
     let area1 = (x1_max - x1_min) * (y1_max - y1_min);
     let area2 = (x2_max - x2_min) * (y2_max - y2_min);
@@ -797,8 +842,8 @@ pub fn apply_nms_with_merge(
 
 /// Calculate IoU between two bounding boxes (standalone function).
 fn calculate_iou_static(box1: &BoundingBox, box2: &BoundingBox) -> f32 {
-    let (x1_min, y1_min, x1_max, y1_max) = (box1.x_min(), box1.y_min(), box1.x_max(), box1.y_max());
-    let (x2_min, y2_min, x2_max, y2_max) = (box2.x_min(), box2.y_min(), box2.x_max(), box2.y_max());
+    let (x1_min, y1_min, x1_max, y1_max) = box1.aabb();
+    let (x2_min, y2_min, x2_max, y2_max) = box2.aabb();
 
     // Calculate intersection
     let x_min = x1_min.max(x2_min);
@@ -869,5 +914,45 @@ mod tests {
         ]);
 
         assert_eq!(processor.calculate_iou(&box1, &box3), 0.0);
+    }
+
+    #[test]
+    fn test_pp_doclayout_under_width_output_does_not_panic() {
+        // Regression: `process_pp_doclayout` must not index `[box_idx, 0, 5]`
+        // when the model emits fewer than 6 feature columns. It should return
+        // empty results instead of panicking.
+        let processor = LayoutPostProcess::new(17, 0.5, 0.5, 100, "pp-doclayout".to_string());
+        let img_shape = ImageScaleInfo::new(100.0, 100.0, 1.0, 1.0);
+
+        // feature_dim = 4 (< 6)
+        let preds = ndarray::Array3::<f32>::zeros((3, 1, 4));
+        let (boxes, classes, scores) = processor.process_pp_doclayout(preds.view(), &img_shape);
+        assert!(boxes.is_empty() && classes.is_empty() && scores.is_empty());
+
+        // Zero rows in the middle dimension.
+        let preds = ndarray::Array3::<f32>::zeros((3, 0, 8));
+        let (boxes, _, _) = processor.process_pp_doclayout(preds.view(), &img_shape);
+        assert!(boxes.is_empty());
+    }
+
+    #[test]
+    fn test_picodet_argmax_handles_non_positive_scores() {
+        // Regression: the class argmax must not seed with 0.0, otherwise a box
+        // whose true max class score is negative is mislabeled as class 0 / 0.0.
+        // Use a negative threshold so the (correctly-found) max survives filtering.
+        let processor = LayoutPostProcess::new(3, -1.0, 1.0, 100, "picodet".to_string());
+        let img_shape = ImageScaleInfo::new(100.0, 100.0, 1.0, 1.0);
+
+        // One box: bbox [10,10,50,50], class scores [-0.9, -0.2, -0.5].
+        // The true argmax is class 1 (-0.2), not class 0.
+        let preds = ndarray::Array3::<f32>::from_shape_vec(
+            (1, 1, 4 + 3),
+            vec![10.0, 10.0, 50.0, 50.0, -0.9, -0.2, -0.5],
+        )
+        .unwrap();
+        let (boxes, classes, scores) = processor.process_picodet(preds.view(), &img_shape);
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(classes[0], 1);
+        assert!((scores[0] - (-0.2)).abs() < 1e-6);
     }
 }

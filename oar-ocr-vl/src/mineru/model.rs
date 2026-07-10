@@ -3,13 +3,14 @@ use super::processing::preprocess_images;
 use super::text::MinerUTextModel;
 use super::vision::MinerUVisionModel;
 use crate::attention::{
-    combine_masks, create_causal_mask, create_left_padding_mask, on_compute_device,
+    combine_masks, create_causal_mask, create_generation_mask, create_left_padding_mask,
 };
 use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear_no_bias};
 use image::RgbImage;
 use oar_ocr_core::core::OCRError;
+use oar_ocr_core::domain::structure::LayoutElementType;
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use serde::Deserialize;
@@ -17,6 +18,60 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::path::Path;
 use tokenizers::Tokenizer;
+
+/// Canonical MinerU2.5 per-element prompts (mirrors `DEFAULT_PROMPTS` in the
+/// official `mineru_vl_utils`). The `two_step_extract` flow routes each cropped
+/// region to the matching prompt; a lone `Text Recognition:` prompt over a whole
+/// page yields generic markdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum MinerUTaskPrompt {
+    /// `\nText Recognition:` — default for body text, titles, paragraphs,
+    /// lists, captions, references, footnotes, page numbers, etc.
+    Text,
+    /// `\nFormula Recognition:` — display formulas (`Formula`,
+    /// `FormulaNumber`).
+    Formula,
+    /// `\nTable Recognition:` — tables.
+    Table,
+    /// `\nImage Analysis:` — figure / image / chart blocks.
+    ImageAnalysis,
+    /// `\nLayout Detection:` — full-page layout dump (only used by
+    /// `two_step_extract` Stage 0). Kept for completeness with the official
+    /// `mineru_vl_utils` prompt set so callers can drive the layout pass
+    /// externally if they choose.
+    #[allow(dead_code)]
+    LayoutDetection,
+}
+
+#[allow(dead_code)]
+impl MinerUTaskPrompt {
+    /// Canonical prompt string (with the leading `\n` that MinerU's
+    /// `two_step_extract` builds via its chat-template wrapper).
+    pub fn prompt(self) -> &'static str {
+        match self {
+            Self::Text => "\nText Recognition:",
+            Self::Formula => "\nFormula Recognition:",
+            Self::Table => "\nTable Recognition:",
+            Self::ImageAnalysis => "\nImage Analysis:",
+            Self::LayoutDetection => "\nLayout Detection:",
+        }
+    }
+
+    /// Map an OAR `LayoutElementType` to the MinerU element prompt that best
+    /// matches its content kind. Mirrors the mapping the official `mineru_vl_utils`
+    /// client uses when picking a per-block prompt (text-like → `[default]`,
+    /// table → `table`, equation → `equation`, image/chart → `image`).
+    pub fn for_layout(t: LayoutElementType) -> Self {
+        use LayoutElementType::*;
+        match t {
+            Table => Self::Table,
+            Formula | FormulaNumber => Self::Formula,
+            Image | Chart | Seal | HeaderImage | FooterImage => Self::ImageAnalysis,
+            _ => Self::Text,
+        }
+    }
+}
 
 pub struct MinerU {
     device: Device,
@@ -103,6 +158,10 @@ impl MinerU {
             .as_ref()
             .and_then(|cfg| cfg.repetition_penalty)
             .unwrap_or(1.0);
+        // generation_config.json ships no `no_repeat_ngram_size`, but the
+        // official two-step extraction (mineru_vl_utils) sets it to 100 for the
+        // default/table/formula recognition passes, which is exactly how this
+        // model is driven here. Match that default when the config is silent.
         let no_repeat_ngram_size = gen_cfg
             .as_ref()
             .and_then(|cfg| cfg.no_repeat_ngram_size)
@@ -133,14 +192,13 @@ impl MinerU {
             });
         }
 
-        let dtype = device.bf16_default_to_f32();
+        let dtype = crate::utils::select_dtype(&device);
+        let weight_files = crate::utils::collect_safetensors(model_dir, "MinerU2.5")?;
+        // SAFETY: from_mmaped_safetensors memory-maps the weight files directly;
+        // the caller must ensure they are valid and not modified while in use.
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[model_dir.join("model.safetensors")],
-                dtype,
-                &device,
-            )
-            .map_err(|e| candle_to_ocr_inference("MinerU2.5", "load model.safetensors", e))?
+            VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)
+                .map_err(|e| candle_to_ocr_inference("MinerU2.5", "load safetensors", e))?
         };
 
         let text = MinerUTextModel::load(&cfg, vb.pp("model"))?;
@@ -174,7 +232,7 @@ impl MinerU {
         let video_token_id = cfg.video_token_id;
         let spatial_merge_size = cfg.vision_config.spatial_merge_size;
 
-        let lm_head = if cfg.tie_word_embeddings {
+        let lm_head = if cfg.tie_word_embeddings() {
             Linear::new(text.token_embedding_weight(), None)
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))
@@ -241,10 +299,13 @@ impl MinerU {
             })];
         }
 
-        match self.generate_internal(images, instructions, max_new_tokens) {
-            Ok(results) => results.into_iter().map(Ok).collect(),
+        match self.generate_tokens_internal(images, instructions, max_new_tokens) {
+            Ok(results) => results
+                .into_iter()
+                .map(|tokens| self.decode_generated_tokens(&tokens))
+                .collect(),
             Err(e) => {
-                let msg = format!("generation failed: {e}");
+                let msg = crate::utils::error_chain_message("generation failed", &e);
                 (0..images.len())
                     .map(|_| {
                         Err(OCRError::InvalidInput {
@@ -256,12 +317,49 @@ impl MinerU {
         }
     }
 
-    fn generate_internal(
+    /// Generate raw baseline tokens for oracle-draft / tokenizer round-trip
+    /// experiments. Tokens are exactly the ids emitted by the decode loop,
+    /// excluding stop tokens, before skip-token filtering and tokenizer decode.
+    pub fn generate_tokens(
         &self,
         images: &[RgbImage],
         instructions: &[impl AsRef<str>],
         max_new_tokens: usize,
-    ) -> Result<Vec<String>, OCRError> {
+    ) -> Vec<Result<Vec<u32>, OCRError>> {
+        if images.is_empty() {
+            return Vec::new();
+        }
+        if images.len() != instructions.len() {
+            return vec![Err(OCRError::InvalidInput {
+                message: format!(
+                    "MinerU2.5: images count ({}) != instructions count ({})",
+                    images.len(),
+                    instructions.len()
+                ),
+            })];
+        }
+
+        match self.generate_tokens_internal(images, instructions, max_new_tokens) {
+            Ok(results) => results.into_iter().map(Ok).collect(),
+            Err(e) => {
+                let msg = crate::utils::error_chain_message("generation failed", &e);
+                (0..images.len())
+                    .map(|_| {
+                        Err(OCRError::InvalidInput {
+                            message: msg.clone(),
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn generate_tokens_internal(
+        &self,
+        images: &[RgbImage],
+        instructions: &[impl AsRef<str>],
+        max_new_tokens: usize,
+    ) -> Result<Vec<Vec<u32>>, OCRError> {
         let batch_size = images.len();
 
         let image_inputs = preprocess_images(images, &self.image_cfg, &self.device, self.dtype)?;
@@ -307,7 +405,11 @@ impl MinerU {
         }
 
         let seq_lens: Vec<usize> = all_input_ids.iter().map(|ids| ids.len()).collect();
-        let max_seq_len = *seq_lens.iter().max().unwrap();
+        let Some(&max_seq_len) = seq_lens.iter().max() else {
+            return Err(OCRError::InvalidInput {
+                message: "MinerU2.5: empty batch is not supported".to_string(),
+            });
+        };
 
         let mut batch_embeds: Vec<Tensor> = Vec::with_capacity(batch_size);
         let mut rope_deltas: Vec<i64> = Vec::with_capacity(batch_size);
@@ -458,14 +560,7 @@ impl MinerU {
                 break;
             }
 
-            let sampling_params = SamplingParams {
-                repetition_penalty: self.repetition_penalty,
-                no_repeat_ngram_size: self.no_repeat_ngram_size,
-                do_sample: self.do_sample,
-                temperature: self.temperature,
-                top_p: self.top_p,
-                top_k: self.top_k,
-            };
+            let sampling_params = self.sampling_params();
             let mut next_tokens: Vec<u32> = Vec::with_capacity(batch_size);
             for (i, logits) in logits_list.iter().enumerate() {
                 if finished[i] {
@@ -528,74 +623,50 @@ impl MinerU {
             }
         }
 
-        let mut results = Vec::with_capacity(batch_size);
-        for tokens in generated.into_iter() {
-            // Filter out bos/eos/pad tokens before decoding (matching official implementation)
-            let filtered: Vec<u32> = tokens
-                .into_iter()
-                .filter(|t| !self.skip_token_ids.contains(t))
-                .collect();
-            let decoded = self
-                .tokenizer
-                .decode(&filtered, false) // skip_special_tokens=false to preserve special tokens
-                .map_err(|e| OCRError::InvalidInput {
-                    message: format!("decode failed: {e}"),
-                })?;
-            results.push(decoded);
-        }
-
-        Ok(results)
+        Ok(generated)
     }
-}
 
-/// Create attention mask for generation steps.
-///
-/// During generation, we need to mask out the left-padding positions in the KV cache.
-/// The mask allows the current query position to attend to all non-padding positions.
-///
-/// # Arguments
-/// * `pad_lens` - Number of padding tokens at the start of each sequence
-/// * `kv_len` - Current KV cache length
-/// * `dtype` - Data type for the mask
-/// * `device` - Device for the mask
-///
-/// # Returns
-/// Mask tensor of shape (batch, 1, 1, kv_len) where padding positions are -inf
-fn create_generation_mask(
-    pad_lens: &[usize],
-    kv_len: usize,
-    dtype: DType,
-    device: &Device,
-) -> Result<Tensor, candle_core::Error> {
-    let batch_size = pad_lens.len();
+    pub fn decode_tokens(&self, tokens: &[u32]) -> Result<String, OCRError> {
+        self.decode_generated_tokens(tokens)
+    }
 
-    on_compute_device(device, |compute_device| {
-        // pad_lens as tensor: (batch, 1, 1, 1)
-        let pad_lens_tensor = Tensor::from_vec(
-            pad_lens.iter().map(|&x| x as u32).collect::<Vec<_>>(),
-            (batch_size, 1, 1, 1),
-            compute_device,
-        )?
-        .to_dtype(dtype)?;
+    /// Decode tokens in the form the model actually emitted. MinerU2.5's
+    /// `decode_tokens` only filters bos/eos/pad before `tokenizer.decode` —
+    /// there is no markdown / wrapping / layout post-process at this layer
+    /// (layout-aware reordering happens in `two_step_extract`, not here).
+    /// This alias exists for API symmetry with PaddleOCR-VL / GLM-OCR.
+    pub fn decode_tokens_raw(&self, tokens: &[u32]) -> Result<String, OCRError> {
+        self.decode_generated_tokens(tokens)
+    }
 
-        // Position indices: (1, 1, 1, kv_len)
-        let pos_tensor = Tensor::arange(0u32, kv_len as u32, compute_device)?
-            .reshape((1, 1, 1, kv_len))?
-            .to_dtype(dtype)?;
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
 
-        // Mask condition: pos < pad_len -> masked (large negative value)
-        let mask_cond = pos_tensor.broadcast_lt(&pad_lens_tensor)?;
+    fn sampling_params(&self) -> SamplingParams {
+        SamplingParams {
+            repetition_penalty: self.repetition_penalty,
+            no_repeat_ngram_size: self.no_repeat_ngram_size,
+            do_sample: self.do_sample,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+        }
+    }
 
-        let zero = Tensor::new(0f32, compute_device)?
-            .to_dtype(dtype)?
-            .broadcast_as(mask_cond.shape())?;
-        // Use large negative value instead of -inf to avoid potential numerical issues
-        let mask_value = Tensor::new(-1e9_f32, compute_device)?
-            .to_dtype(dtype)?
-            .broadcast_as(mask_cond.shape())?;
-
-        mask_cond.where_cond(&mask_value, &zero)
-    })
+    fn decode_generated_tokens(&self, tokens: &[u32]) -> Result<String, OCRError> {
+        // Filter out bos/eos/pad tokens before decoding (matching official implementation).
+        let filtered: Vec<u32> = tokens
+            .iter()
+            .copied()
+            .filter(|t| !self.skip_token_ids.contains(t))
+            .collect();
+        self.tokenizer
+            .decode(&filtered, false) // skip_special_tokens=false to preserve special tokens
+            .map_err(|e| OCRError::InvalidInput {
+                message: format!("decode failed: {e}"),
+            })
+    }
 }
 
 fn build_prompt(instruction: &str) -> String {
@@ -637,11 +708,26 @@ fn select_next_token(
         .to_vec1::<f32>()
         .map_err(|e| candle_to_ocr_inference("MinerU2.5", "logits to vec", e))?;
 
-    apply_repetition_penalty(&mut logits_vec, history, params.repetition_penalty);
-    apply_no_repeat_ngram(&mut logits_vec, history, params.no_repeat_ngram_size);
+    apply_sampling_processors(&mut logits_vec, history, params);
 
     if !params.do_sample || params.top_k == 1 {
         return Ok(argmax_token(&logits_vec));
+    }
+
+    let probs = softmax(&logits_vec);
+    if let Some(idx) = sample_from_probs(&probs) {
+        Ok(idx as u32)
+    } else {
+        Ok(argmax_token(&logits_vec))
+    }
+}
+
+fn apply_sampling_processors(logits: &mut [f32], history: &[u32], params: &SamplingParams) {
+    apply_repetition_penalty(logits, history, params.repetition_penalty);
+    apply_no_repeat_ngram(logits, history, params.no_repeat_ngram_size);
+
+    if !params.do_sample || params.top_k == 1 {
+        return;
     }
 
     let temp = if params.temperature <= 0.0 {
@@ -650,20 +736,13 @@ fn select_next_token(
         params.temperature
     };
     if (temp - 1.0).abs() > f32::EPSILON {
-        for val in logits_vec.iter_mut() {
+        for val in logits.iter_mut() {
             *val /= temp;
         }
     }
 
-    apply_top_k(&mut logits_vec, params.top_k);
-    apply_top_p(&mut logits_vec, params.top_p);
-
-    let probs = softmax(&logits_vec);
-    if let Some(idx) = sample_from_probs(&probs) {
-        Ok(idx as u32)
-    } else {
-        Ok(argmax_token(&logits_vec))
-    }
+    apply_top_k(logits, params.top_k);
+    apply_top_p(logits, params.top_p);
 }
 
 fn argmax_token(logits: &[f32]) -> u32 {
@@ -839,6 +918,8 @@ fn get_rope_index(
     spatial_merge_size: usize,
     device: &Device,
 ) -> Result<(Tensor, i64), OCRError> {
+    // Qwen2-VL multimodal RoPE has three position axes: temporal, height, width.
+    const NUM_ROPE_AXES: usize = 3;
     let image_token_id = cfg.image_token_id;
     let mut image_count = 0usize;
     for i in 0..input_ids.len().saturating_sub(1) {
@@ -920,7 +1001,7 @@ fn get_rope_index(
         });
     }
 
-    let mut pos_ids: Vec<i64> = vec![0; 3 * input_ids.len()];
+    let mut pos_ids: Vec<i64> = vec![0; NUM_ROPE_AXES * input_ids.len()];
     let len = input_ids.len();
     for (i, v) in positions.iter().enumerate() {
         pos_ids[i] = v[0];
@@ -930,7 +1011,7 @@ fn get_rope_index(
 
     let rope_delta = (current_max + 1) - (input_ids.len() as i64);
 
-    let position_ids = Tensor::from_vec(pos_ids, (3usize, 1usize, input_ids.len()), device)
+    let position_ids = Tensor::from_vec(pos_ids, (NUM_ROPE_AXES, 1usize, input_ids.len()), device)
         .map_err(|e| {
             candle_to_ocr_processing(
                 oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
@@ -940,4 +1021,99 @@ fn get_rope_index(
         })?;
 
     Ok((position_ids, rope_delta))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mineru_task_prompt_text_recognition_matches_official() {
+        assert_eq!(MinerUTaskPrompt::Text.prompt(), "\nText Recognition:");
+    }
+
+    #[test]
+    fn mineru_task_prompt_formula_recognition_matches_official() {
+        assert_eq!(MinerUTaskPrompt::Formula.prompt(), "\nFormula Recognition:");
+    }
+
+    #[test]
+    fn mineru_task_prompt_table_recognition_matches_official() {
+        assert_eq!(MinerUTaskPrompt::Table.prompt(), "\nTable Recognition:");
+    }
+
+    #[test]
+    fn mineru_task_prompt_image_analysis_matches_official() {
+        assert_eq!(
+            MinerUTaskPrompt::ImageAnalysis.prompt(),
+            "\nImage Analysis:"
+        );
+    }
+
+    #[test]
+    fn mineru_task_prompt_layout_detection_matches_official() {
+        assert_eq!(
+            MinerUTaskPrompt::LayoutDetection.prompt(),
+            "\nLayout Detection:"
+        );
+    }
+
+    #[test]
+    fn for_layout_routes_table_kinds_to_table() {
+        assert_eq!(
+            MinerUTaskPrompt::for_layout(LayoutElementType::Table),
+            MinerUTaskPrompt::Table
+        );
+    }
+
+    #[test]
+    fn for_layout_routes_formula_kinds_to_formula() {
+        assert_eq!(
+            MinerUTaskPrompt::for_layout(LayoutElementType::Formula),
+            MinerUTaskPrompt::Formula
+        );
+        assert_eq!(
+            MinerUTaskPrompt::for_layout(LayoutElementType::FormulaNumber),
+            MinerUTaskPrompt::Formula
+        );
+    }
+
+    #[test]
+    fn for_layout_routes_visual_kinds_to_image_analysis() {
+        for ty in [
+            LayoutElementType::Image,
+            LayoutElementType::Chart,
+            LayoutElementType::Seal,
+            LayoutElementType::HeaderImage,
+            LayoutElementType::FooterImage,
+        ] {
+            assert_eq!(
+                MinerUTaskPrompt::for_layout(ty),
+                MinerUTaskPrompt::ImageAnalysis,
+                "expected ImageAnalysis for {ty:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn for_layout_defaults_text_for_text_like_kinds() {
+        for ty in [
+            LayoutElementType::Text,
+            LayoutElementType::Content,
+            LayoutElementType::DocTitle,
+            LayoutElementType::ParagraphTitle,
+            LayoutElementType::List,
+            LayoutElementType::Reference,
+            LayoutElementType::Footnote,
+            LayoutElementType::Number,
+            LayoutElementType::Header,
+            LayoutElementType::Footer,
+        ] {
+            assert_eq!(
+                MinerUTaskPrompt::for_layout(ty),
+                MinerUTaskPrompt::Text,
+                "expected Text for {ty:?}",
+            );
+        }
+    }
 }

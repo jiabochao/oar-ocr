@@ -5,8 +5,9 @@ use super::ernie::Ernie4_5Model;
 use super::processing;
 use super::projector::Projector;
 use super::vision::VisionModel;
-use crate::attention::{combine_masks, create_causal_mask, create_left_padding_mask};
-use crate::utils::image::pil_resample_to_filter_type;
+use crate::attention::{
+    combine_masks, create_causal_mask, create_generation_mask, create_left_padding_mask,
+};
 use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::Module;
@@ -109,14 +110,13 @@ impl PaddleOcrVl {
                     .to_string(),
             })?;
 
-        let dtype = device.bf16_default_to_f32();
+        let dtype = crate::utils::select_dtype(&device);
+        let weight_files = crate::utils::collect_safetensors(model_dir, "PaddleOCR-VL")?;
+        // SAFETY: from_mmaped_safetensors memory-maps the weight files directly;
+        // the caller must ensure they are valid and not modified while in use.
         let vb = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(
-                &[model_dir.join("model.safetensors")],
-                dtype,
-                &device,
-            )
-            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "load model.safetensors", e))?
+            candle_nn::VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "load safetensors", e))?
         };
 
         let llm = Ernie4_5Model::load(&cfg, vb.pp("model"))?;
@@ -186,10 +186,52 @@ impl PaddleOcrVl {
             })];
         }
 
-        match self.generate_internal(images, tasks, max_new_tokens) {
+        match self.generate_tokens_internal(images, tasks, max_new_tokens) {
+            Ok(results) => results
+                .into_iter()
+                .enumerate()
+                .map(|(i, tokens)| self.decode_generated_tokens(&tokens, tasks[i]))
+                .collect(),
+            Err(e) => {
+                let msg = crate::utils::error_chain_message("generation failed", &e);
+                (0..images.len())
+                    .map(|_| {
+                        Err(OCRError::InvalidInput {
+                            message: msg.clone(),
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Generate raw baseline tokens for oracle-draft / tokenizer round-trip
+    /// experiments. Tokens are exactly the ids emitted by the decode loop,
+    /// excluding EOS / separator stop tokens, before tokenizer decoding or
+    /// task postprocessing.
+    pub fn generate_tokens(
+        &self,
+        images: &[RgbImage],
+        tasks: &[PaddleOcrVlTask],
+        max_new_tokens: usize,
+    ) -> Vec<Result<Vec<u32>, OCRError>> {
+        if images.is_empty() {
+            return Vec::new();
+        }
+        if images.len() != tasks.len() {
+            return vec![Err(OCRError::InvalidInput {
+                message: format!(
+                    "PaddleOCR-VL: images count ({}) != tasks count ({})",
+                    images.len(),
+                    tasks.len()
+                ),
+            })];
+        }
+
+        match self.generate_tokens_internal(images, tasks, max_new_tokens) {
             Ok(results) => results.into_iter().map(Ok).collect(),
             Err(e) => {
-                let msg = format!("generation failed: {e}");
+                let msg = crate::utils::error_chain_message("generation failed", &e);
                 (0..images.len())
                     .map(|_| {
                         Err(OCRError::InvalidInput {
@@ -202,23 +244,23 @@ impl PaddleOcrVl {
     }
 
     /// Internal generation implementation supporting batched inference.
-    fn generate_internal(
+    fn generate_tokens_internal(
         &self,
         images: &[RgbImage],
         tasks: &[PaddleOcrVlTask],
         max_new_tokens: usize,
-    ) -> Result<Vec<(String, String)>, OCRError> {
+    ) -> Result<Vec<Vec<u32>>, OCRError> {
         let batch_size = images.len();
 
         // 1. Preprocess all images
         let needs_spotting = tasks.iter().any(|t| t.needs_spotting_preprocess());
-        let resized_images;
+        let resized_images: Vec<RgbImage>;
         let images_for_preprocess = if needs_spotting {
-            let resize_filter = self
-                .image_cfg
-                .resample
-                .and_then(pil_resample_to_filter_type)
-                .unwrap_or(FilterType::CatmullRom);
+            // The official spotting preprocessing hardcodes LANCZOS for the 2x
+            // pre-upscale (README inference script), independent of the
+            // processor's `resample` (which only governs the model-internal
+            // smart_resize). Match it with Lanczos3 here.
+            let resize_filter = FilterType::Lanczos3;
             let mut processed = Vec::with_capacity(images.len());
             for (img, task) in images.iter().zip(tasks.iter()) {
                 if task.needs_spotting_preprocess()
@@ -235,8 +277,8 @@ impl PaddleOcrVl {
                     processed.push(img.clone());
                 }
             }
-            resized_images = Some(processed);
-            resized_images.as_ref().unwrap().as_slice()
+            resized_images = processed;
+            resized_images.as_slice()
         } else {
             images
         };
@@ -303,7 +345,11 @@ impl PaddleOcrVl {
 
         // 4. Build embeddings per sample
         let seq_lens: Vec<usize> = all_input_ids.iter().map(|ids| ids.len()).collect();
-        let max_seq_len = *seq_lens.iter().max().unwrap();
+        let Some(&max_seq_len) = seq_lens.iter().max() else {
+            return Err(OCRError::InvalidInput {
+                message: "PaddleOCR-VL: empty batch is not supported".to_string(),
+            });
+        };
 
         let mut batch_embeds: Vec<Tensor> = Vec::with_capacity(batch_size);
         let mut rope_deltas: Vec<i64> = Vec::with_capacity(batch_size);
@@ -440,6 +486,12 @@ impl PaddleOcrVl {
             .map(|(&len, &d)| (len as i64) + d)
             .collect();
 
+        // Left-padding lengths per row, and current KV-cache length (grows by one
+        // each decode step). Used to mask out padding KV during generation so a
+        // batch with unequal prompt lengths does not attend to padding positions.
+        let pad_lens: Vec<usize> = seq_lens.iter().map(|&len| max_seq_len - len).collect();
+        let mut kv_len = max_seq_len;
+
         for _ in 0..max_new_tokens {
             if finished.iter().all(|&f| f) {
                 break;
@@ -479,7 +531,12 @@ impl PaddleOcrVl {
                 .and_then(|t| t.reshape((3, batch_size, 1)))
                 .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "create pos", e))?;
 
-            let hs = self.llm.forward(&embeds, &pos, None)?;
+            // Mask out left-padding positions in the KV cache for this step.
+            kv_len += 1;
+            let gen_mask = create_generation_mask(&pad_lens, kv_len, self.dtype, &self.device)
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "create gen mask", e))?;
+
+            let hs = self.llm.forward(&embeds, &pos, Some(&gen_mask))?;
 
             logits_list.clear();
             for i in 0..batch_size {
@@ -502,20 +559,43 @@ impl PaddleOcrVl {
             }
         }
 
-        // 10. Decode results
-        let mut results = Vec::with_capacity(batch_size);
-        for (i, tokens) in generated.into_iter().enumerate() {
-            let decoded =
-                self.tokenizer
-                    .decode(&tokens, true)
-                    .map_err(|e| OCRError::InvalidInput {
-                        message: format!("decode failed: {e}"),
-                    })?;
-            let processed = tasks[i].postprocess(decoded.clone());
-            results.push((decoded, processed));
-        }
+        Ok(generated)
+    }
 
-        Ok(results)
+    pub fn decode_tokens(
+        &self,
+        tokens: &[u32],
+        task: PaddleOcrVlTask,
+    ) -> Result<(String, String), OCRError> {
+        self.decode_generated_tokens(tokens, task)
+    }
+
+    /// Decode tokens **without** applying PaddleOCR-VL's task-specific
+    /// post-process (OTSL→HTML for tables, `$$..$$` stripping for formulas).
+    /// This is the raw pre-postprocess string the model actually emitted —
+    /// use this when feeding PaddleOCR-VL output as a draft for another
+    /// target VLM. DSV matches at token granularity, so any post-process on
+    /// the source side will byte-mismatch the target's natural output.
+    pub fn decode_tokens_raw(&self, tokens: &[u32]) -> Result<String, OCRError> {
+        self.tokenizer
+            .decode(tokens, true)
+            .map_err(|e| OCRError::InvalidInput {
+                message: format!("decode failed: {e}"),
+            })
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    fn decode_generated_tokens(
+        &self,
+        tokens: &[u32],
+        task: PaddleOcrVlTask,
+    ) -> Result<(String, String), OCRError> {
+        let decoded = self.decode_tokens_raw(tokens)?;
+        let processed = task.postprocess(decoded.clone());
+        Ok((decoded, processed))
     }
 }
 

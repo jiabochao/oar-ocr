@@ -4,13 +4,91 @@ use super::config::{HunyuanOcrConfig, HunyuanOcrImageProcessorConfig};
 use super::llm::HunyuanLlm;
 use super::processing::{HunyuanOcrImageInputs, preprocess_image};
 use super::vision::HunyuanVisionModel;
-use crate::attention::{combine_masks, create_causal_mask, create_left_padding_mask};
+use crate::attention::{
+    combine_masks, create_causal_mask, create_generation_mask, create_left_padding_mask,
+};
 use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
 use image::RgbImage;
 use oar_ocr_core::core::OCRError;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokenizers::Tokenizer;
+
+/// Read `generation_config.json::repetition_penalty`. Returns 1.0 (no-op) if
+/// the file is missing, unparseable, or the field is absent — matches
+/// HuggingFace's default. Local HunyuanOCR config ships 1.03.
+fn load_repetition_penalty(model_dir: &Path) -> f64 {
+    let path = model_dir.join("generation_config.json");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return 1.0;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return 1.0;
+    };
+    v.get("repetition_penalty")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(1.0)
+}
+
+/// Read `generation_config.json::eos_token_id`. The official config provides
+/// a list (e.g. `[120007, 120020]`). Returns `None` if the file is missing
+/// or the field is absent.
+fn load_generation_eos_ids(model_dir: &Path) -> Option<Vec<u32>> {
+    let contents = std::fs::read_to_string(model_dir.join("generation_config.json")).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    let eos = v.get("eos_token_id")?;
+    if let Some(single) = eos.as_u64() {
+        u32::try_from(single).ok().map(|id| vec![id])
+    } else {
+        eos.as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_u64().and_then(|v| u32::try_from(v).ok()))
+                .collect()
+        })
+    }
+}
+
+/// Apply HuggingFace's `RepetitionPenaltyLogitsProcessor` rule to a 1D logits
+/// tensor and return the argmax id. For each token id that appears in
+/// `seen`, the rule pushes its logit toward zero **once**:
+/// `logit /= penalty` when positive, `logit *= penalty` when non-positive
+/// (see `transformers.generation.logits_process.RepetitionPenaltyLogitsProcessor`).
+/// HF computes this with `scatter(input_ids, …)`, which collapses duplicate
+/// positions in `input_ids` down to a single penalty per unique vocab id —
+/// applying the penalty per *occurrence* would compound to `penalty^k` for a
+/// token repeated `k` times and quickly suppresses legitimate high-frequency
+/// tokens like `<td>` in a structured HTML page. We dedup before applying.
+fn argmax_with_repetition_penalty(
+    logits: &Tensor,
+    seen: &[u32],
+    penalty: f32,
+) -> Result<u32, OCRError> {
+    let mut vec = logits
+        .to_dtype(DType::F32)
+        .and_then(|t| t.to_vec1::<f32>())
+        .map_err(|e| candle_to_ocr_inference("HunyuanOCR", "rep penalty to_vec1", e))?;
+    let vocab = vec.len();
+    let mut unique: Vec<u32> = seen.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    for &id in &unique {
+        let idx = id as usize;
+        if idx >= vocab {
+            continue;
+        }
+        let v = vec[idx];
+        vec[idx] = if v > 0.0 { v / penalty } else { v * penalty };
+    }
+    let mut best_idx = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in vec.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    Ok(best_idx as u32)
+}
 
 pub struct HunyuanOcr {
     device: Device,
@@ -21,6 +99,13 @@ pub struct HunyuanOcr {
     llm: HunyuanLlm,
     vision: HunyuanVisionModel,
     stop_token_ids: Vec<u32>,
+    /// `generation_config.json::repetition_penalty`. HuggingFace's
+    /// `generate(do_sample=False)` still applies repetition_penalty via the
+    /// LogitsProcessor list before the argmax. Without it, large-context chart
+    /// inputs can collapse into runaway-repeat loops (e.g. Mermaid node IDs
+    /// `A, B, … BZ, BZW, BZWW, BZWWZ …`) that never hit EOS. Default 1.0 means
+    /// the value isn't applied.
+    repetition_penalty: f64,
 }
 
 impl HunyuanOcr {
@@ -43,12 +128,18 @@ impl HunyuanOcr {
         if let Some(id) = tokenizer.token_to_id("<｜hy_Assistant｜>") {
             stop_token_ids.push(id);
         }
+        // Also include eos_token_ids from generation_config.json — the official
+        // config lists [120007, 120020]; missing 120007 can cause the model to
+        // overshoot past a valid stop point.
+        if let Some(gen_eos) = load_generation_eos_ids(model_dir) {
+            stop_token_ids.extend(gen_eos);
+        }
         stop_token_ids.sort_unstable();
         stop_token_ids.dedup();
 
-        let dtype = device.bf16_default_to_f32();
+        let dtype = crate::utils::select_dtype(&device);
 
-        let weight_files = resolve_safetensors_shards(model_dir)?;
+        let weight_files = crate::utils::collect_safetensors(model_dir, "HunyuanOCR")?;
         // SAFETY: from_mmaped_safetensors is unsafe because it memory-maps weight files
         // directly. The caller must ensure the safetensors files are valid and not corrupted.
         let vb = unsafe {
@@ -59,6 +150,8 @@ impl HunyuanOcr {
         let llm = HunyuanLlm::load(&cfg, vb.pp("model"))?;
         let vision = HunyuanVisionModel::load(&cfg.vision_config, vb.pp("vit"))?;
 
+        let repetition_penalty = load_repetition_penalty(model_dir);
+
         Ok(Self {
             device,
             dtype,
@@ -68,6 +161,7 @@ impl HunyuanOcr {
             llm,
             vision,
             stop_token_ids,
+            repetition_penalty,
         })
     }
 
@@ -101,10 +195,50 @@ impl HunyuanOcr {
             })];
         }
 
-        match self.generate_internal(images, instructions, max_new_tokens) {
+        match self.generate_tokens_internal(images, instructions, max_new_tokens) {
+            Ok(results) => results
+                .into_iter()
+                .map(|tokens| self.decode_generated_tokens(&tokens))
+                .collect(),
+            Err(e) => {
+                let msg = crate::utils::error_chain_message("generation failed", &e);
+                (0..images.len())
+                    .map(|_| {
+                        Err(OCRError::InvalidInput {
+                            message: msg.clone(),
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Generate raw baseline tokens for oracle-draft / tokenizer round-trip
+    /// experiments. Tokens are exactly the ids emitted by the decode loop,
+    /// excluding stop tokens, before tokenizer decoding or trimming.
+    pub fn generate_tokens(
+        &self,
+        images: &[RgbImage],
+        instructions: &[impl AsRef<str>],
+        max_new_tokens: usize,
+    ) -> Vec<Result<Vec<u32>, OCRError>> {
+        if images.is_empty() {
+            return Vec::new();
+        }
+        if images.len() != instructions.len() {
+            return vec![Err(OCRError::InvalidInput {
+                message: format!(
+                    "HunyuanOCR: images count ({}) != instructions count ({})",
+                    images.len(),
+                    instructions.len()
+                ),
+            })];
+        }
+
+        match self.generate_tokens_internal(images, instructions, max_new_tokens) {
             Ok(results) => results.into_iter().map(Ok).collect(),
             Err(e) => {
-                let msg = format!("generation failed: {e}");
+                let msg = crate::utils::error_chain_message("generation failed", &e);
                 (0..images.len())
                     .map(|_| {
                         Err(OCRError::InvalidInput {
@@ -117,12 +251,12 @@ impl HunyuanOcr {
     }
 
     /// Internal generation implementation supporting batched inference.
-    fn generate_internal(
+    fn generate_tokens_internal(
         &self,
         images: &[RgbImage],
         instructions: &[impl AsRef<str>],
         max_new_tokens: usize,
-    ) -> Result<Vec<String>, OCRError> {
+    ) -> Result<Vec<Vec<u32>>, OCRError> {
         let batch_size = images.len();
 
         // 1. Preprocess all images and build prompts
@@ -187,16 +321,16 @@ impl HunyuanOcr {
                 });
             }
 
-            // Fuse image embeddings
+            // Fuse image embeddings into the token embedding sequence.
             let (start_pos, end_pos) = find_image_span(input_ids, &self.cfg)?;
-            let region_len = end_pos - start_pos + 1;
+            let inner_len = end_pos.saturating_sub(start_pos + 1);
             let (img_len, _) = image_embeds
                 .dims2()
                 .map_err(|e| candle_to_ocr_inference("HunyuanOCR", "image_embeds dims2", e))?;
-            if region_len != img_len {
+            if inner_len != img_len {
                 return Err(OCRError::InvalidInput {
                     message: format!(
-                        "HunyuanOCR: image span length mismatch: tokens={region_len} embeds={img_len}"
+                        "HunyuanOCR: image-token run length mismatch: tokens={inner_len} embeds={img_len}"
                     ),
                 });
             }
@@ -206,16 +340,16 @@ impl HunyuanOcr {
             })?;
 
             let mut parts: Vec<Tensor> = Vec::with_capacity(3);
-            if start_pos > 0 {
-                parts.push(token_embeds.i((0..start_pos, ..)).map_err(|e| {
-                    candle_to_ocr_inference("HunyuanOCR", "slice prefix embeddings", e)
-                })?);
-            }
+            // Prefix incl. image_start (text-embedded).
+            parts.push(token_embeds.i((0..=start_pos, ..)).map_err(|e| {
+                candle_to_ocr_inference("HunyuanOCR", "slice prefix embeddings", e)
+            })?);
             parts.push(image_embeds);
-            if end_pos + 1 < input_ids.len() {
+            if end_pos < input_ids.len() {
+                // Suffix incl. image_end (text-embedded).
                 parts.push(
                     token_embeds
-                        .i((end_pos + 1..input_ids.len(), ..))
+                        .i((end_pos..input_ids.len(), ..))
                         .map_err(|e| {
                             candle_to_ocr_inference("HunyuanOCR", "slice suffix embeddings", e)
                         })?,
@@ -295,6 +429,12 @@ impl HunyuanOcr {
         let mut finished: Vec<bool> = vec![false; batch_size];
         let mut positions: Vec<i64> = seq_lens.iter().map(|&len| len as i64).collect();
 
+        // Left-padding lengths per row, and current KV-cache length (grows by one
+        // each decode step). Used to mask out padding KV during generation so a
+        // batch with unequal prompt lengths does not attend to padding positions.
+        let pad_lens: Vec<usize> = seq_lens.iter().map(|&len| max_seq_len - len).collect();
+        let mut kv_len = max_seq_len;
+
         for _ in 0..max_new_tokens {
             if finished.iter().all(|&f| f) {
                 break;
@@ -305,10 +445,25 @@ impl HunyuanOcr {
                 if finished[i] {
                     next_tokens.push(0); // Padding token for finished samples
                 } else {
-                    let tok = logits
-                        .argmax(D::Minus1)
-                        .and_then(|t| t.to_scalar::<u32>())
-                        .map_err(|e| candle_to_ocr_inference("HunyuanOCR", "argmax", e))?;
+                    // Mirror HuggingFace's `generate(do_sample=False)`: even
+                    // greedy decoding runs the LogitsProcessor list, so the
+                    // `repetition_penalty` from generation_config.json gets
+                    // applied to logits before argmax. Without this the model
+                    // can spiral into runaway-repeat loops on large-context
+                    // inputs (observed on chart_01.jpg, seq≈11584, producing
+                    // 33K chars of synthetic Mermaid node IDs `BZ, BZW, …`).
+                    let tok = if self.repetition_penalty > 1.0 && !generated[i].is_empty() {
+                        argmax_with_repetition_penalty(
+                            logits,
+                            &generated[i],
+                            self.repetition_penalty as f32,
+                        )?
+                    } else {
+                        logits
+                            .argmax(D::Minus1)
+                            .and_then(|t| t.to_scalar::<u32>())
+                            .map_err(|e| candle_to_ocr_inference("HunyuanOCR", "argmax", e))?
+                    };
 
                     if self.stop_token_ids.contains(&tok) {
                         finished[i] = true;
@@ -335,7 +490,12 @@ impl HunyuanOcr {
                 .and_then(|t| t.reshape((4, batch_size, 1)))
                 .map_err(|e| candle_to_ocr_inference("HunyuanOCR", "create pos", e))?;
 
-            let hs = self.llm.forward(&embeds, &pos, None)?;
+            // Mask out left-padding positions in the KV cache for this step.
+            kv_len += 1;
+            let gen_mask = create_generation_mask(&pad_lens, kv_len, self.dtype, &self.device)
+                .map_err(|e| candle_to_ocr_inference("HunyuanOCR", "create gen mask", e))?;
+
+            let hs = self.llm.forward(&embeds, &pos, Some(&gen_mask))?;
 
             logits_list.clear();
             for i in 0..batch_size {
@@ -353,19 +513,32 @@ impl HunyuanOcr {
             }
         }
 
-        // 8. Decode results
-        let mut results = Vec::with_capacity(batch_size);
-        for tokens in generated {
-            let decoded =
-                self.tokenizer
-                    .decode(&tokens, true)
-                    .map_err(|e| OCRError::InvalidInput {
-                        message: format!("HunyuanOCR: tokenizer decode failed: {e}"),
-                    })?;
-            results.push(decoded.trim().to_string());
-        }
+        self.llm.clear_kv_cache();
+        Ok(generated)
+    }
 
-        Ok(results)
+    pub fn decode_tokens(&self, tokens: &[u32]) -> Result<String, OCRError> {
+        self.decode_generated_tokens(tokens)
+    }
+
+    /// Decode tokens in the form the model actually emitted. HunyuanOCR's
+    /// `decode_tokens` only applies `trim()` post-process, so this is
+    /// effectively an alias provided for API symmetry with backends that do
+    /// have non-trivial post-process (PaddleOCR-VL / GLM-OCR).
+    pub fn decode_tokens_raw(&self, tokens: &[u32]) -> Result<String, OCRError> {
+        self.tokenizer
+            .decode(tokens, true)
+            .map_err(|e| OCRError::InvalidInput {
+                message: format!("HunyuanOCR: tokenizer decode failed: {e}"),
+            })
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    fn decode_generated_tokens(&self, tokens: &[u32]) -> Result<String, OCRError> {
+        Ok(self.decode_tokens_raw(tokens)?.trim().to_string())
     }
 
     fn logits_from_hidden(&self, hidden: &Tensor) -> Result<Tensor, OCRError> {
@@ -392,33 +565,6 @@ impl HunyuanOcr {
     }
 }
 
-fn resolve_safetensors_shards(model_dir: &Path) -> Result<Vec<PathBuf>, OCRError> {
-    let single = model_dir.join("model.safetensors");
-    if single.exists() {
-        return Ok(vec![single]);
-    }
-
-    let mut shards: Vec<PathBuf> = std::fs::read_dir(model_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.starts_with("model-") && s.ends_with(".safetensors"))
-        })
-        .collect();
-    shards.sort();
-    if shards.is_empty() {
-        return Err(OCRError::ConfigError {
-            message: format!(
-                "HunyuanOCR: no safetensors shards found in {}",
-                model_dir.display()
-            ),
-        });
-    }
-    Ok(shards)
-}
-
 fn build_prompt(instruction: &str) -> String {
     // Matches the tokenizer chat_template in the model repo (empty system message).
     // The model expects the generation prompt to end with `<｜hy_User｜>`.
@@ -435,7 +581,12 @@ fn expand_image_tokens_in_place(
     image_inputs: &HunyuanOcrImageInputs,
 ) -> Result<(), OCRError> {
     let (_, hm, wm) = image_inputs.grid_thw_merged;
-    let expected_tokens = hm.saturating_mul(wm.saturating_add(1));
+    // Upstream processor: num_image_tokens = patch_h * (patch_w + 1) + 2
+    // (processing_hunyuan_vl.py:62). The `+ 2` covers the perceive step's
+    // begin/end markers, whose positions are also replaced by image
+    // embeddings. The placeholder run is contiguous `image_token_id` only —
+    // no `image_newline_token_id` interleaving.
+    let expected_tokens = hm.saturating_mul(wm.saturating_add(1)).saturating_add(2);
     if expected_tokens == 0 {
         return Err(OCRError::InvalidInput {
             message: "HunyuanOCR: empty merged grid".to_string(),
@@ -458,13 +609,10 @@ fn expand_image_tokens_in_place(
         });
     };
 
-    let mut expanded: Vec<u32> = Vec::with_capacity(expected_tokens);
-    for _r in 0..hm {
-        expanded.extend(std::iter::repeat_n(cfg.image_token_id, wm));
-        expanded.push(cfg.image_newline_token_id);
-    }
-
-    // Replace the single placeholder image_token_id with the expanded sequence.
+    let expanded: Vec<u32> = std::iter::repeat_n(cfg.image_token_id, expected_tokens).collect();
+    // Replace the single image_token_id placeholder with the expanded run.
+    // image_start_token_id and image_end_token_id stay in input_ids on
+    // either side; they receive plain text embeddings via embed_tokens.
     input_ids.splice(pos..pos + 1, expanded);
     Ok(())
 }
@@ -493,6 +641,21 @@ fn build_position_ids(
     image_inputs: &HunyuanOcrImageInputs,
 ) -> Result<Tensor, OCRError> {
     let seq_len = input_ids.len();
+    // 4-axis XDRoPE position ids matching the upstream HF processor exactly:
+    //   transformers/models/hunyuan_vl/processing_hunyuan_vl.py:74-94.
+    //
+    // Axis order is `[seq, w, h, t]` (the order `select_rope_sections`
+    // expects for `xdrope_section`). For non-image tokens all four axes hold
+    // the plain sequence index. For the spatial run inside the image span we
+    // overwrite axes w/h/t:
+    //   - w cycles `0..(patch_w+1)`, repeated `patch_h` times,
+    //   - h is `[h]*(patch_w+1)` for `h` in `0..patch_h`,
+    //   - t is 0 across the run.
+    // The run starts at `first_image_token + 1` and spans `(patch_w+1)*patch_h`
+    // tokens — the *middle* of the expanded `patch_h*(patch_w+1) + 2` block;
+    // the perceive begin/end markers keep their default arange position.
+    // Collapsing the spatial axes to plain 1-D sequence ids destroys the 2-D
+    // geometry the trained weights expect and yields hallucinated text.
     let mut pos: Vec<i64> = vec![0; 4 * seq_len];
     for i in 0..seq_len {
         let p = i as i64;
@@ -502,36 +665,27 @@ fn build_position_ids(
         pos[3 * seq_len + i] = p;
     }
 
-    let (start_pos, _end_pos) = find_image_span(input_ids, cfg)?;
-    let vision_start = input_ids[start_pos + 1..]
-        .iter()
-        .position(|&id| id == cfg.image_token_id)
-        .map(|p| start_pos + 1 + p)
-        .ok_or_else(|| OCRError::InvalidInput {
-            message: "HunyuanOCR: image_token_id not found after image_start_token_id".to_string(),
-        })?;
-
-    let (_, hm, wm) = image_inputs.grid_thw_merged;
-    let vision_tokens = hm.saturating_mul(wm.saturating_add(1));
-    let base = vision_start as i64;
-
-    for j in 0..vision_tokens {
-        let idx = vision_start + j;
-        if idx >= seq_len {
+    let first_image_pos = input_ids.iter().position(|&id| id == cfg.image_token_id);
+    if let Some(first) = first_image_pos {
+        let (_, hm, wm) = image_inputs.grid_thw_merged;
+        let start = first + 1;
+        let replace_num = (wm + 1) * hm;
+        if start + replace_num > seq_len {
             return Err(OCRError::InvalidInput {
                 message: format!(
-                    "HunyuanOCR: vision token span exceeds input length (start={vision_start} count={vision_tokens} len={seq_len})"
+                    "HunyuanOCR: image span ({} positions starting at {}) exceeds input length {}",
+                    replace_num, start, seq_len
                 ),
             });
         }
-        let row = j / (wm + 1);
-        let col = j % (wm + 1);
-        let t_pos = base;
-        let h_pos = base + row as i64;
-        let w_pos = base + col as i64;
-        pos[seq_len + idx] = t_pos;
-        pos[2 * seq_len + idx] = h_pos;
-        pos[3 * seq_len + idx] = w_pos;
+        for j in 0..replace_num {
+            let idx = start + j;
+            let row = j / (wm + 1); // 0..hm
+            let col = j % (wm + 1); // 0..wm (inclusive of newline column)
+            pos[seq_len + idx] = col as i64; // axis 1 = w
+            pos[2 * seq_len + idx] = row as i64; // axis 2 = h
+            pos[3 * seq_len + idx] = 0; // axis 3 = t
+        }
     }
 
     Tensor::from_vec(

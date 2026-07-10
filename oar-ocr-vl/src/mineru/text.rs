@@ -2,11 +2,11 @@ use super::config::MinerUConfig;
 use crate::attention::{
     RotaryEmbedding, repeat_kv, scaled_dot_product_attention, select_rope_sections,
 };
+use crate::kv_trim::TrimmableKvCache;
 use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing, rotate_half};
 use candle_core::Tensor;
 use candle_nn::{
-    Embedding, Linear, Module, VarBuilder, embedding, kv_cache::KvCache, linear, linear_no_bias,
-    rms_norm,
+    Embedding, Linear, Module, VarBuilder, embedding, linear, linear_no_bias, rms_norm,
 };
 use oar_ocr_core::core::OCRError;
 use std::cell::RefCell;
@@ -132,7 +132,7 @@ struct MinerUAttention {
     head_dim: usize,
     scaling: f64,
     mrope_section: Vec<usize>,
-    kv_cache: RefCell<KvCache>,
+    kv_cache: RefCell<TrimmableKvCache>,
 }
 
 impl MinerUAttention {
@@ -174,7 +174,8 @@ impl MinerUAttention {
         )
         .map_err(|e| candle_to_ocr_inference("MinerU2.5", "load o_proj", e))?;
 
-        let kv_cache = KvCache::new(2, cfg.max_position_embeddings.max(8192));
+        // Trim/gather-capable KV cache.
+        let kv_cache = TrimmableKvCache::new(2, cfg.max_position_embeddings.max(8192));
 
         Ok(Self {
             q_proj,

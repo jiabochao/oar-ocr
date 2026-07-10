@@ -7,6 +7,7 @@ use crate::core::errors::OCRError;
 use ort::{session::Session, value::ValueType};
 use std::sync::Mutex;
 
+mod model_source;
 pub mod session;
 mod tensor_output;
 
@@ -18,6 +19,8 @@ mod ort_infer_config;
 #[path = "ort_infer_execution.rs"]
 mod ort_infer_execution;
 
+pub use model_source::ModelSource;
+pub use ort_infer_builders::ensure_cuda_launch_blocking;
 pub use ort_infer_execution::TensorInput;
 pub use session::load_session;
 pub use tensor_output::TensorOutput;
@@ -83,6 +86,30 @@ impl OrtInfer {
             ValueType::Tensor { shape, .. } => Some(shape.iter().copied().collect()),
             _ => None,
         }
+    }
+
+    /// Returns the declared output names and tensor shapes from the first session.
+    ///
+    /// This is intended for model adapters that need to choose among multiple
+    /// ONNX outputs before interpreting tensors semantically.
+    pub fn output_shapes(&self) -> Vec<(String, Vec<i64>)> {
+        let Some(session_mutex) = self.sessions.first() else {
+            return Vec::new();
+        };
+        let Ok(session_guard) = session_mutex.lock() else {
+            return Vec::new();
+        };
+        session_guard
+            .outputs()
+            .iter()
+            .filter_map(|output| match output.dtype() {
+                ValueType::Tensor { shape, .. } => Some((
+                    output.name().to_string(),
+                    shape.iter().copied().collect::<Vec<_>>(),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 }
 

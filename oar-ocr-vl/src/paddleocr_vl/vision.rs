@@ -5,6 +5,77 @@ use candle_nn::Module;
 use oar_ocr_core::core::OCRError;
 use rayon::prelude::*;
 
+/// Above this seq length vision attention runs chunked along the query dim
+/// instead of materializing the full `[seq, seq]` buffer. Kept above v1.5's
+/// worst-case seq (≈5040) because chunking shifts cuBLAS tiling and a few
+/// low-confidence argmax tokens; the full path keeps v1.5 byte-stable.
+const ATTN_FULL_SEQ_THRESHOLD: usize = 8192;
+/// Query chunk size for chunked attention (~110 MB F32 softmax scratch at
+/// seq_k = 3600, heads = 16).
+const ATTN_CHUNK_SIZE: usize = 512;
+/// Free-memory headroom for allocations after the softmax scratch peak.
+const ATTN_FREE_MEM_HEADROOM: usize = 256 * 1024 * 1024;
+
+/// [`ATTN_FULL_SEQ_THRESHOLD`], overridable via the
+/// `OAR_VL_ATTN_FULL_SEQ_THRESHOLD` env var (`0` forces chunked attention).
+fn attn_full_seq_threshold() -> usize {
+    static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        match std::env::var("OAR_VL_ATTN_FULL_SEQ_THRESHOLD") {
+            Ok(v) => match v.trim().parse() {
+                Ok(t) => {
+                    tracing::info!(
+                        "vision attention full-seq threshold {t} from OAR_VL_ATTN_FULL_SEQ_THRESHOLD"
+                    );
+                    t
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "ignoring invalid OAR_VL_ATTN_FULL_SEQ_THRESHOLD value '{v}' (expected an integer)"
+                    );
+                    ATTN_FULL_SEQ_THRESHOLD
+                }
+            },
+            Err(_) => ATTN_FULL_SEQ_THRESHOLD,
+        }
+    })
+}
+
+/// Peak transient bytes of the full-matrix path: the `[b, heads, seq, seq]`
+/// scores in the compute dtype, their F32 copy, the F32 softmax output, and
+/// the cast back are all live at once. `None` on `usize` overflow.
+fn eager_attn_scratch_bytes(b: usize, heads: usize, seq: usize, dtype: DType) -> Option<usize> {
+    let per_element = 2 * dtype.size_in_bytes() + 2 * DType::F32.size_in_bytes();
+    b.checked_mul(heads)?
+        .checked_mul(seq)?
+        .checked_mul(seq)?
+        .checked_mul(per_element)
+}
+
+/// Whether the full-matrix path fits in free device memory. Unknown free
+/// memory (CPU, Metal, query failure) keeps the full path; an overflowed
+/// scratch estimate (`None`) never fits.
+fn eager_attn_fits(device: &Device, scratch_bytes: Option<usize>) -> bool {
+    let Some(scratch_bytes) = scratch_bytes else {
+        return false;
+    };
+    match crate::utils::free_device_memory(device) {
+        Some(free) => match scratch_bytes.checked_add(ATTN_FREE_MEM_HEADROOM) {
+            Some(needed) if needed <= free => true,
+            _ => {
+                tracing::debug!(
+                    "vision attention falling back to chunked path: needs ~{} MiB scratch \
+                     but only {} MiB device memory is free",
+                    scratch_bytes / (1024 * 1024),
+                    free / (1024 * 1024),
+                );
+                false
+            }
+        },
+        None => true,
+    }
+}
+
 /// SigLIP-style 2D rotary embedding for vision encoder
 #[derive(Debug, Clone)]
 struct SigLIPRotaryEmbedding {
@@ -13,18 +84,7 @@ struct SigLIPRotaryEmbedding {
 
 impl SigLIPRotaryEmbedding {
     fn new(dim: usize, theta: f64, device: &Device) -> Result<Self, OCRError> {
-        let mut inv_freq = Vec::with_capacity(dim / 2);
-        for i in (0..dim).step_by(2) {
-            let v = 1f64 / theta.powf(i as f64 / dim as f64);
-            inv_freq.push(v as f32);
-        }
-        let inv_freq = Tensor::from_vec(inv_freq, (dim / 2,), device).map_err(|e| {
-            candle_to_ocr_processing(
-                oar_ocr_core::core::errors::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: failed to create vision inv_freq tensor",
-                e,
-            )
-        })?;
+        let inv_freq = crate::utils::vision_inv_freq(dim, theta, "PaddleOCR-VL", device)?;
         Ok(Self { inv_freq })
     }
 
@@ -341,33 +401,83 @@ impl VisionAttention {
             )
         };
 
-        let attn_weights = q
-            .matmul(
-                &k.transpose(2, 3)
-                    .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision k t23", e))?
-                    .contiguous()
+        let kt = k
+            .transpose(2, 3)
+            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision k t23", e))?
+            .contiguous()
+            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision k t23 contiguous", e))?;
+
+        // Full-matrix path only when seq is below the threshold AND its softmax
+        // scratch fits in free device memory — large images otherwise OOM on
+        // small-VRAM GPUs (issue #147). The chunked fallback is numerically
+        // equivalent (mirrors PyTorch SDPA's memory profile).
+        let attn_output = if seq <= attn_full_seq_threshold()
+            && eager_attn_fits(
+                hidden_states.device(),
+                eager_attn_scratch_bytes(b, self.num_heads, seq, q.dtype()),
+            ) {
+            // Kept byte-identical to the original implementation: removing the
+            // final `.contiguous()` changes cuBLAS' matmul-shape selection and
+            // shifts low-confidence argmax tokens.
+            let scores = q
+                .matmul(&kt)
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision qk matmul", e))?
+                .affine(self.scale, 0.0)
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision scaling", e))?;
+            let probs =
+                candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32).map_err(|e| {
+                    candle_to_ocr_inference("PaddleOCR-VL", "vision attn cast f32", e)
+                })?)
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision attn softmax", e))?
+                .to_dtype(v.dtype())
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision attn cast back", e))?
+                .contiguous()
+                .map_err(|e| {
+                    candle_to_ocr_inference("PaddleOCR-VL", "vision attn contiguous", e)
+                })?;
+            probs
+                .matmul(&v)
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision av matmul", e))?
+        } else {
+            let mut chunks: Vec<Tensor> = Vec::with_capacity(seq.div_ceil(ATTN_CHUNK_SIZE));
+            let mut start = 0;
+            while start < seq {
+                let len = ATTN_CHUNK_SIZE.min(seq - start);
+                let q_chunk = q
+                    .narrow(2, start, len)
+                    .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision q narrow", e))?;
+                let scores = q_chunk
+                    .matmul(&kt)
                     .map_err(|e| {
-                        candle_to_ocr_inference("PaddleOCR-VL", "vision k t23 contiguous", e)
+                        candle_to_ocr_inference("PaddleOCR-VL", "vision qk matmul (chunk)", e)
+                    })?
+                    .affine(self.scale, 0.0)
+                    .map_err(|e| {
+                        candle_to_ocr_inference("PaddleOCR-VL", "vision scaling (chunk)", e)
+                    })?;
+                let probs = candle_nn::ops::softmax_last_dim(
+                    &scores.to_dtype(DType::F32).map_err(|e| {
+                        candle_to_ocr_inference("PaddleOCR-VL", "vision attn cast f32 (chunk)", e)
                     })?,
-            )
-            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision qk matmul", e))?
-            .affine(self.scale, 0.0)
-            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision scaling", e))?;
+                )
+                .map_err(|e| {
+                    candle_to_ocr_inference("PaddleOCR-VL", "vision attn softmax (chunk)", e)
+                })?
+                .to_dtype(v.dtype())
+                .map_err(|e| {
+                    candle_to_ocr_inference("PaddleOCR-VL", "vision attn cast back (chunk)", e)
+                })?;
+                let out_chunk = probs.matmul(&v).map_err(|e| {
+                    candle_to_ocr_inference("PaddleOCR-VL", "vision av matmul (chunk)", e)
+                })?;
+                chunks.push(out_chunk);
+                start += len;
+            }
+            Tensor::cat(&chunks, 2)
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision av concat", e))?
+        };
 
-        let attn_weights = candle_nn::ops::softmax_last_dim(
-            &attn_weights
-                .to_dtype(DType::F32)
-                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision attn cast f32", e))?,
-        )
-        .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision attn softmax", e))?
-        .to_dtype(v.dtype())
-        .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision attn cast back", e))?
-        .contiguous()
-        .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision attn contiguous", e))?;
-
-        let attn_output = attn_weights
-            .matmul(&v)
-            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision av matmul", e))?
+        let attn_output = attn_output
             .transpose(1, 2)
             .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision out transpose", e))?
             .reshape((b, seq, embed_dim))
@@ -923,6 +1033,21 @@ fn interpolate_bilinear_align_corners_false(
 #[cfg(test)]
 mod tests {
     use super::interpolate_bilinear_align_corners_false;
+
+    #[test]
+    fn eager_attn_scratch_bytes_estimate_and_overflow() {
+        use candle_core::DType;
+        // f16 scores + f32 copy + f32 softmax output + f16 cast back = 12 B/elem.
+        assert_eq!(
+            super::eager_attn_scratch_bytes(1, 16, 5000, DType::F16),
+            Some(16 * 5000 * 5000 * 12)
+        );
+        // An overflowing product must report "doesn't fit", not wrap around.
+        assert_eq!(
+            super::eager_attn_scratch_bytes(1, 16, usize::MAX / 2, DType::F16),
+            None
+        );
+    }
 
     #[test]
     fn interpolate_same_size_is_identity() {

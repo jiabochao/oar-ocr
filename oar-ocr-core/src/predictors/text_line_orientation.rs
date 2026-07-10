@@ -6,7 +6,6 @@ use super::builder::PredictorBuilderState;
 use crate::TaskPredictorBuilder;
 use crate::core::OcrResult;
 use crate::core::traits::OrtConfigurable;
-use crate::core::traits::adapter::AdapterBuilder;
 use crate::core::traits::task::ImageTaskInput;
 use crate::domain::adapters::TextLineOrientationAdapterBuilder;
 use crate::domain::tasks::document_orientation::Classification;
@@ -15,7 +14,6 @@ use crate::domain::tasks::text_line_orientation::{
 };
 use crate::predictors::TaskPredictorCore;
 use image::RgbImage;
-use std::path::Path;
 
 /// Text line orientation prediction result
 #[derive(Debug, Clone)]
@@ -77,7 +75,10 @@ impl TextLineOrientationPredictorBuilder {
         self
     }
 
-    pub fn build<P: AsRef<Path>>(self, model_path: P) -> OcrResult<TextLineOrientationPredictor> {
+    pub fn build(
+        self,
+        model_source: impl Into<crate::core::ModelSource>,
+    ) -> OcrResult<TextLineOrientationPredictor> {
         let Self { state, input_shape } = self;
         let (config, ort_config) = state.into_parts();
         let mut adapter_builder = TextLineOrientationAdapterBuilder::new()
@@ -88,7 +89,7 @@ impl TextLineOrientationPredictorBuilder {
             adapter_builder = adapter_builder.with_ort_config(ort_cfg);
         }
 
-        let adapter = Box::new(adapter_builder.build(model_path.as_ref())?);
+        let adapter = super::build_adapter(adapter_builder, model_source)?;
         let task = TextLineOrientationTask::new(config.clone());
         Ok(TextLineOrientationPredictor {
             core: TaskPredictorCore::new(adapter, task, config),

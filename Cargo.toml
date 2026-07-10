@@ -3,7 +3,7 @@ members = [".", "oar-ocr-derive", "oar-ocr-core", "oar-ocr-vl"]
 resolver = "2"
 
 [workspace.package]
-version = "0.6.3"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -12,8 +12,22 @@ repository = "https://github.com/greatv/oar-ocr"
 homepage = "https://github.com/greatv/oar-ocr"
 
 [workspace.dependencies]
-oar-ocr-core = { version = "0.6.3", path = "oar-ocr-core", default-features = false }
-oar-ocr-derive = { version = "0.6.3", path = "oar-ocr-derive", default-features = false }
+oar-ocr-core = { version = "0.8.0", path = "oar-ocr-core", default-features = false }
+oar-ocr-derive = { version = "0.8.0", path = "oar-ocr-derive", default-features = false }
+
+# Shared third-party dependencies (kept in sync via workspace inheritance).
+clap = { version = "4.5.42", features = ["derive"] }
+hayro = "0.7"
+image = "0.25.6"
+imageproc = "0.27.0"
+rayon = "1.8"
+regex = "1.11.1"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+tempfile = "3.19"
+tokenizers = { version = "0.23", default-features = false, features = ["progressbar", "onig"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [package]
 name = "oar-ocr"
@@ -36,7 +50,9 @@ keywords = [
 categories = ["computer-vision", "science"]
 
 [features]
-default = ["download-binaries"]
+default = ["download-binaries", "simd"]
+# SIMD-accelerate hot CPU pre/post-processing kernels (see oar-ocr-core).
+simd = ["oar-ocr-core/simd"]
 # ONNX Runtime execution provider features
 cuda = ["oar-ocr-core/cuda"]
 tensorrt = ["oar-ocr-core/tensorrt"]
@@ -48,25 +64,26 @@ openvino = ["oar-ocr-core/openvino"]
 # Set ORT_LIB_LOCATION to use a custom installation (skips download).
 # Use --no-default-features for offline/enterprise environments.
 download-binaries = ["oar-ocr-core/download-binaries"]
+# Auto-download OCR model files at runtime from ModelScope into `$OAR_HOME`
+# (default `~/.oar`). When enabled, builder methods that take a model path
+# accept either a filesystem path or a bare registered file name.
+auto-download = ["oar-ocr-core/auto-download"]
 
 [dependencies]
-# Core library with all types and predictors
+image.workspace = true
+imageproc.workspace = true
 oar-ocr-core.workspace = true
-# Derive macros
 oar-ocr-derive.workspace = true
-
-# Direct dependencies for oarocr module
-image = "0.25.6"
-imageproc = "0.26.0"
-serde = { version = "1.0", features = ["derive", "rc"] }
-serde_json = "1.0"
-rayon = "1.8"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
-clap = { version = "4.5.42", features = ["derive"] }
-tempfile = "3.19"
 ab_glyph = "0.2"
-hayro = "0.5"
-regex = "1"
+clap.workspace = true
+fontdb = "0.23"
+hayro.workspace = true
+regex.workspace = true
+tempfile.workspace = true

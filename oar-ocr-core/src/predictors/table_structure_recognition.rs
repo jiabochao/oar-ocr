@@ -7,7 +7,6 @@ use crate::TaskPredictorBuilder;
 use crate::core::OcrResult;
 use crate::core::errors::OCRError;
 use crate::core::traits::OrtConfigurable;
-use crate::core::traits::adapter::AdapterBuilder;
 use crate::core::traits::task::ImageTaskInput;
 use crate::domain::adapters::{SLANetWiredAdapterBuilder, SLANetWirelessAdapterBuilder};
 use crate::domain::tasks::table_structure_recognition::{
@@ -34,19 +33,25 @@ enum TableStructureModelFamily {
 }
 
 impl TableStructureModelFamily {
+    /// `Wired` carries the 512×512 default that matches SLANeXt ONNX exports;
+    /// `Wireless` carries the 488×488 default that matches PaddleX's
+    /// `ResizeTableImage(max_len=488)+PaddingTableImage(488,488)` pipeline used
+    /// by both SLANet and SLANet_plus.
     fn from_model_name(model_name: &str) -> Option<Self> {
         match model_name {
-            "SLANet" | "SLANeXt_wired" | "SLANeXt_wireless" => Some(Self::Wired),
-            "SLANet_plus" => Some(Self::Wireless),
+            "SLANeXt_wired" | "SLANeXt_wireless" => Some(Self::Wired),
+            "SLANet" | "SLANet_plus" => Some(Self::Wireless),
             _ => None,
         }
     }
 
     fn detect_from_path(path: &Path) -> Option<Self> {
         let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
-        if stem.contains("slanet_plus") {
+        if stem.contains("slanext") {
+            Some(Self::Wired)
+        } else if stem.contains("slanet_plus") || stem.contains("slanet") {
             Some(Self::Wireless)
-        } else if stem.contains("wired") || stem.contains("slanet") || stem.contains("slanext") {
+        } else if stem.contains("wired") {
             Some(Self::Wired)
         } else {
             None
@@ -129,9 +134,9 @@ impl TableStructureRecognitionPredictorBuilder {
         self
     }
 
-    pub fn build<P: AsRef<Path>>(
+    pub fn build(
         self,
-        model_path: P,
+        model_source: impl Into<crate::core::ModelSource>,
     ) -> OcrResult<TableStructureRecognitionPredictor> {
         let Self {
             state,
@@ -143,7 +148,7 @@ impl TableStructureRecognitionPredictorBuilder {
         let dict_path = dict_path.ok_or_else(|| {
             OCRError::missing_field("dict_path", "TableStructureRecognitionPredictor")
         })?;
-        let model_path = model_path.as_ref();
+        let model_source = model_source.into();
 
         let model_family = if let Some(name) = model_name.as_deref() {
             TableStructureModelFamily::from_model_name(name).ok_or_else(|| {
@@ -156,9 +161,13 @@ impl TableStructureRecognitionPredictorBuilder {
                 }
             })?
         } else {
-            TableStructureModelFamily::detect_from_path(model_path)
+            model_source
+                .as_path()
+                .and_then(TableStructureModelFamily::detect_from_path)
                 .unwrap_or(TableStructureModelFamily::Wired)
         };
+
+        let dict_path = super::resolve_asset_path(&dict_path)?;
 
         let adapter = match model_family {
             TableStructureModelFamily::Wired => {
@@ -178,7 +187,7 @@ impl TableStructureRecognitionPredictorBuilder {
                     adapter_builder = adapter_builder.with_ort_config(ort_cfg);
                 }
 
-                Box::new(adapter_builder.build(model_path)?)
+                super::build_adapter(adapter_builder, model_source)?
             }
             TableStructureModelFamily::Wireless => {
                 let mut adapter_builder = SLANetWirelessAdapterBuilder::new()
@@ -197,7 +206,7 @@ impl TableStructureRecognitionPredictorBuilder {
                     adapter_builder = adapter_builder.with_ort_config(ort_cfg);
                 }
 
-                Box::new(adapter_builder.build(model_path)?)
+                super::build_adapter(adapter_builder, model_source)?
             }
         };
         let task = TableStructureRecognitionTask::new(config.clone());

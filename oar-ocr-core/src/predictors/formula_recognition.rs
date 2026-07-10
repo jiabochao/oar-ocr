@@ -7,7 +7,6 @@ use crate::TaskPredictorBuilder;
 use crate::core::OcrResult;
 use crate::core::errors::OCRError;
 use crate::core::traits::OrtConfigurable;
-use crate::core::traits::adapter::AdapterBuilder;
 use crate::core::traits::task::ImageTaskInput;
 use crate::domain::adapters::{PPFormulaNetAdapterBuilder, UniMERNetAdapterBuilder};
 use crate::domain::tasks::formula_recognition::{FormulaRecognitionConfig, FormulaRecognitionTask};
@@ -105,6 +104,7 @@ impl FormulaRecognitionPredictorBuilder {
             state: PredictorBuilderState::new(FormulaRecognitionConfig {
                 score_threshold: 0.0,
                 max_length: 1536,
+                batch_size: 8,
             }),
             model_name: "FormulaRecognition".to_string(),
             tokenizer_path: None,
@@ -150,7 +150,10 @@ impl FormulaRecognitionPredictorBuilder {
     }
 
     /// Build the formula recognition predictor
-    pub fn build<P: AsRef<Path>>(self, model_path: P) -> OcrResult<FormulaRecognitionPredictor> {
+    pub fn build(
+        self,
+        model_source: impl Into<crate::core::ModelSource>,
+    ) -> OcrResult<FormulaRecognitionPredictor> {
         let Self {
             state,
             model_name,
@@ -164,6 +167,7 @@ impl FormulaRecognitionPredictorBuilder {
         let tokenizer_path = tokenizer_path.ok_or_else(|| {
             OCRError::missing_field("tokenizer_path", "FormulaRecognitionPredictor")
         })?;
+        let tokenizer_path = super::resolve_asset_path(&tokenizer_path)?;
 
         // Determine model kind
         let model_kind =
@@ -184,7 +188,7 @@ impl FormulaRecognitionPredictorBuilder {
                     builder = builder.with_ort_config(ort_cfg);
                 }
 
-                Box::new(builder.build(model_path.as_ref())?)
+                super::build_adapter(builder, model_source)?
             }
             FormulaModelKind::PPFormulaNet => {
                 let mut builder = PPFormulaNetAdapterBuilder::new()
@@ -200,7 +204,7 @@ impl FormulaRecognitionPredictorBuilder {
                     builder = builder.with_ort_config(ort_cfg);
                 }
 
-                Box::new(builder.build(model_path.as_ref())?)
+                super::build_adapter(builder, model_source)?
             }
         };
 

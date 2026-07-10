@@ -1,6 +1,6 @@
 # OAR-OCR
 
-![Crates.io Version](https://img.shields.io/crates/v/oar-ocr)
+[![Crates.io Version](https://img.shields.io/crates/v/oar-ocr)](https://crates.io/crates/oar-ocr)
 ![Crates.io Downloads (recent)](https://img.shields.io/crates/dr/oar-ocr)
 [![dependency status](https://deps.rs/repo/github/GreatV/oar-ocr/status.svg)](https://deps.rs/repo/github/GreatV/oar-ocr)
 ![GitHub License](https://img.shields.io/github/license/GreatV/oar-ocr)
@@ -20,6 +20,16 @@ With GPU support:
 ```bash
 cargo add oar-ocr --features cuda
 ```
+
+With auto-download of model files from ModelScope:
+
+```bash
+cargo add oar-ocr --features auto-download
+```
+
+Bare file names passed to the builders are then fetched from [ModelScope](https://www.modelscope.cn/models/greatv/oar-ocr) into `$OAR_HOME` (default `~/.oar`) and verified against their expected SHA-256. See [docs/models.md](docs/models.md#auto-download-via-the-auto-download-feature) for the exact path resolution rules.
+
+Everywhere a builder accepts a model path it also accepts raw ONNX bytes (e.g. `include_bytes!`), so models can be embedded into a single binary — see [Loading Models from Memory](docs/usage.md#loading-models-from-memory).
 
 ### Basic Usage
 
@@ -46,6 +56,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for text_region in &results[0].text_regions {
         if let Some((text, confidence)) = text_region.text_with_confidence() {
             println!("Text: {} ({:.2})", text, confidence);
+        }
+    }
+
+    Ok(())
+}
+```
+
+### PP-OCRv6
+
+PP-OCRv6 ships in three sizes. Pass the bare file names below and enable the `auto-download` feature to fetch them automatically or point to local paths:
+
+Size | Detection | Recognition | Dictionary
+-----|-----|-----|-----
+tiny | `pp-ocrv6_tiny_det.onnx` | `pp-ocrv6_tiny_rec.onnx` | `ppocrv6_tiny_dict.txt`
+small | `pp-ocrv6_small_det.onnx` | `pp-ocrv6_small_rec.onnx` | `ppocrv6_dict.txt`
+medium | `pp-ocrv6_medium_det.onnx` | `pp-ocrv6_medium_rec.onnx` | `ppocrv6_dict.txt`
+
+```rust
+use oar_ocr::prelude::*;
+use oar_ocr::domain::tasks::TextDetectionConfig;
+use std::path::Path;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // PP-OCRv6 "tiny" — swap in small/medium (with ppocrv6_dict.txt) for higher accuracy.
+    let ocr = OAROCRBuilder::new(
+        "pp-ocrv6_tiny_det.onnx",
+        "pp-ocrv6_tiny_rec.onnx",
+        "ppocrv6_tiny_dict.txt",
+    )
+    // Official PP-OCRv6 detection defaults.
+    .text_detection_config(TextDetectionConfig {
+        score_threshold: 0.2,
+        box_threshold: 0.45,
+        unclip_ratio: 1.4,
+        ..Default::default()
+    })
+    .build()?;
+
+    let image = load_image(Path::new("document.jpg"))?;
+    let results = ocr.predict(vec![image])?;
+
+    for region in &results[0].text_regions {
+        if let Some((text, confidence)) = region.text_with_confidence() {
+            println!("{text}  ({confidence:.2})");
         }
     }
 
@@ -84,12 +138,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Vision-Language Models (VLM)
 
-For advanced document understanding using Vision-Language Models (like PaddleOCR-VL, **PaddleOCR-VL-1.5**, UniRec, and MinerU2.5), check out the [`oar-ocr-vl`](oar-ocr-vl/README.md) crate.
+For advanced document understanding using Vision-Language Models (like PaddleOCR-VL, PaddleOCR-VL-1.5, **PaddleOCR-VL-1.6**, GLM-OCR, HunyuanOCR, and MinerU2.5), check out the [`oar-ocr-vl`](oar-ocr-vl/README.md) crate.
 
 ## Documentation
 
 - [**Usage Guide**](docs/usage.md) - Detailed API usage, builder patterns, GPU configuration
 - [**Pre-trained Models**](docs/models.md) - Model download links and recommended configurations
+- [**Environment Variables**](docs/environment-variables.md) - Runtime configuration via `OAR_*` variables
+- [**FAQ**](docs/FAQ.md) - Common build and runtime questions
 
 ## Examples
 
@@ -116,7 +172,5 @@ This project builds upon the excellent work of several open-source projects:
 - **[ort](https://github.com/pykeio/ort)**: Rust bindings for ONNX Runtime by pykeio. This crate provides the Rust interface to ONNX Runtime that powers the efficient inference engine in this OCR library.
 
 - **[PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)**: Baidu's awesome multilingual OCR toolkits based on PaddlePaddle. This project utilizes PaddleOCR's pre-trained models, which provide excellent accuracy and performance for text detection and recognition across multiple languages.
-
-- **[OpenOCR](https://github.com/Topdu/OpenOCR)**: An open-source toolkit for general OCR research and applications by the FVL Laboratory at Fudan University. We use the UniRec model for unified text, formula, and table recognition.
 
 - **[Candle](https://github.com/huggingface/candle)**: A minimalist ML framework for Rust by Hugging Face. We use Candle to implement Vision-Language model inference.

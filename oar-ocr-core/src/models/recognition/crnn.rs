@@ -7,7 +7,7 @@ use crate::core::OCRError;
 use crate::core::inference::{OrtInfer, TensorInput};
 use crate::processors::{CTCLabelDecode, OCRResize};
 use image::RgbImage;
-use std::path::Path;
+use rayon::prelude::*;
 
 /// CRNN model output containing recognized text and confidence scores.
 #[derive(Debug, Clone)]
@@ -76,45 +76,45 @@ impl CRNNModel {
         // Calculate final tensor width
         let tensor_width = ((img_h as f32 * max_wh_ratio) as usize).min(self.resizer.max_img_w);
 
-        // Process each image: resize → normalize → pad
         let batch_size = images.len();
-        let mut batch_tensor = ndarray::Array4::<f32>::zeros((batch_size, 3, img_h, tensor_width));
+        let plane = img_h * tensor_width;
+        let image_len = 3 * plane;
 
-        for (batch_idx, img) in images.iter().enumerate() {
-            let (orig_w, orig_h) = (img.width() as f32, img.height() as f32);
-            let ratio = orig_w / orig_h;
+        let per_image: Vec<Vec<f32>> = images
+            .par_iter()
+            .map(|img| {
+                let (orig_w, orig_h) = (img.width() as f32, img.height() as f32);
+                let ratio = orig_w / orig_h;
+                let resized_w = ((img_h as f32 * ratio).ceil() as usize).min(tensor_width);
+                let resized = image::imageops::resize(
+                    img,
+                    resized_w as u32,
+                    img_h as u32,
+                    image::imageops::FilterType::Triangle,
+                );
 
-            // Calculate resize width
-            let resized_w = ((img_h as f32 * ratio).ceil() as usize).min(tensor_width);
+                let mut tensor = vec![0.0f32; image_len];
+                // Normalize `(v / 255 - 0.5) / 0.5` in BGR order into the padded
+                // CHW tensor via the SIMD kernel, reading the resized crop's raw
+                // interleaved bytes (no per-pixel `get_pixel`).
+                crate::processors::simd::normalize_crnn_chw_into(
+                    resized.as_raw(),
+                    resized_w,
+                    img_h,
+                    tensor_width,
+                    &mut tensor,
+                );
+                tensor
+            })
+            .collect();
 
-            // Resize image (without padding)
-            let resized = image::imageops::resize(
-                img,
-                resized_w as u32,
-                img_h as u32,
-                image::imageops::FilterType::Triangle,
-            );
-
-            // Normalize and copy to tensor with zero padding
-            // Channel order: BGR, so we need to swap channels
-            // Normalization: (pixel / 255 - 0.5) / 0.5
-            for y in 0..img_h {
-                for x in 0..resized_w {
-                    let pixel = resized.get_pixel(x as u32, y as u32);
-                    // BGR order for PaddlePaddle models
-                    let b = (pixel[2] as f32 / 255.0 - 0.5) / 0.5;
-                    let g = (pixel[1] as f32 / 255.0 - 0.5) / 0.5;
-                    let r = (pixel[0] as f32 / 255.0 - 0.5) / 0.5;
-
-                    batch_tensor[[batch_idx, 0, y, x]] = b;
-                    batch_tensor[[batch_idx, 1, y, x]] = g;
-                    batch_tensor[[batch_idx, 2, y, x]] = r;
-                }
-            }
-            // Rest of the tensor remains zero (zero-padding)
+        let mut data = Vec::with_capacity(batch_size * image_len);
+        for tensor in per_image {
+            data.extend(tensor);
         }
 
-        Ok(batch_tensor)
+        ndarray::Array4::from_shape_vec((batch_size, 3, img_h, tensor_width), data)
+            .map_err(|e| OCRError::tensor_operation("Failed to create CRNN input tensor", e))
     }
 
     /// Runs inference on the preprocessed tensor.
@@ -172,11 +172,14 @@ impl CRNNModel {
     /// # Returns
     ///
     /// Model output containing recognized texts, scores, and optionally character positions
-    pub fn postprocess(
+    pub fn postprocess<S>(
         &self,
-        predictions: &ndarray::Array3<f32>,
+        predictions: &ndarray::ArrayBase<S, ndarray::Ix3>,
         return_positions: bool,
-    ) -> CRNNModelOutput {
+    ) -> CRNNModelOutput
+    where
+        S: ndarray::Data<Elem = f32> + Sync,
+    {
         if return_positions {
             // Decode CTC predictions with character positions and column indices
             let (texts, scores, char_positions, char_col_indices, sequence_lengths) =
@@ -226,9 +229,29 @@ impl CRNNModel {
         }
         let batch_tensor = self.preprocess(images)?;
         tracing::debug!("CRNN preprocess output shape: {:?}", batch_tensor.shape());
-        let predictions = self.infer(&batch_tensor)?;
-        tracing::debug!("CRNN infer output shape: {:?}", predictions.shape());
-        let output = self.postprocess(&predictions, return_positions);
+
+        // Decode straight from ONNX Runtime's output buffer. Building an owned
+        // `Array3` here would force a multi-hundred-MB (often multi-GB) copy of
+        // the `(batch, time, vocab)` logits per call; instead we wrap the
+        // borrowed slice in a zero-copy `ArrayView3` and run CTC decode on it.
+        let input_name = self.inference.input_name();
+        let inputs = vec![(input_name, TensorInput::Array4(&batch_tensor))];
+        let output = self
+            .inference
+            .infer_first_output_f32(&inputs, |shape, data| {
+                if shape.len() != 3 {
+                    return Err(OCRError::InvalidInput {
+                        message: format!(
+                            "CRNN: expected 3D output (batch, time, vocab), got shape {shape:?}"
+                        ),
+                    });
+                }
+                let view = ndarray::ArrayView3::from_shape((shape[0], shape[1], shape[2]), data)
+                    .map_err(|e| OCRError::InvalidInput {
+                        message: format!("CRNN: failed to view output as 3D array: {e}"),
+                    })?;
+                Ok(self.postprocess(&view, return_positions))
+            })?;
         tracing::debug!(
             "CRNN postprocess: {} texts, first 3: {:?}",
             output.texts.len(),
@@ -307,16 +330,19 @@ impl CRNNModelBuilder {
     }
 
     /// Builds the CRNN model.
-    pub fn build(self, model_path: &Path) -> Result<CRNNModel, OCRError> {
+    pub fn build(
+        self,
+        model_source: impl Into<crate::core::ModelSource>,
+    ) -> Result<CRNNModel, OCRError> {
         // Create ONNX inference engine
         let inference = if self.ort_config.is_some() {
             let common = crate::core::config::ModelInferenceConfig {
                 ort_session: self.ort_config,
                 ..Default::default()
             };
-            OrtInfer::from_config(&common, model_path, None)?
+            OrtInfer::from_config(&common, model_source, None)?
         } else {
-            OrtInfer::new(model_path, None)?
+            OrtInfer::new(model_source, None)?
         };
 
         // Create resizer

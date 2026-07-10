@@ -314,6 +314,14 @@ struct Args {
     #[arg(long, default_value = "cuda")]
     device: String,
 
+    /// Number of pages/images to process per image-level batch
+    #[arg(long = "image-batch-size")]
+    image_batch_size: Option<usize>,
+
+    /// Number of cropped regions to process per recognition batch
+    #[arg(long = "region-batch-size")]
+    region_batch_size: Option<usize>,
+
     /// Layout detection score threshold (varies by class, 0.3-0.5)
     #[arg(long, default_value = "0.5")]
     layout_score_thresh: f32,
@@ -334,6 +342,10 @@ struct Args {
     #[arg(long, default_value_t = 1536)]
     formula_max_length: usize,
 
+    /// Preferred formula recognition batch size
+    #[arg(long, default_value_t = 8)]
+    formula_batch_size: usize,
+
     /// Text detection score threshold (DB thresh, default: 0.3)
     #[arg(long, default_value = "0.3")]
     det_score_thresh: f32,
@@ -353,10 +365,6 @@ struct Args {
     /// Text recognition score threshold (default: 0.0)
     #[arg(long, default_value = "0.0")]
     rec_score_thresh: f32,
-
-    /// Max text length for recognition
-    #[arg(long, default_value_t = 320)]
-    text_rec_max_length: usize,
 
     /// Seal detection score threshold (default: 0.2, lower than general text)
     #[arg(long, default_value = "0.2")]
@@ -551,6 +559,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let formula_config = FormulaRecognitionConfig {
         score_threshold: args.formula_score_thresh,
         max_length: args.formula_max_length,
+        batch_size: args.formula_batch_size,
     };
 
     let text_det_config = TextDetectionConfig {
@@ -566,7 +575,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let text_rec_config = TextRecognitionConfig {
         score_threshold: args.rec_score_thresh,
-        max_text_length: args.text_rec_max_length,
     };
 
     // Build structure pipeline
@@ -578,6 +586,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(config) = parse_device_config(&args.device)? {
         builder = builder.ort_session(config);
+    }
+
+    if let Some(size) = args.image_batch_size {
+        builder = builder.image_batch_size(size);
+    }
+
+    if let Some(size) = args.region_batch_size {
+        builder = builder.region_batch_size(size);
     }
 
     if let Some(path) = args.orientation_model {
@@ -674,7 +690,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Collect all results for potential concatenation
     let mut all_results: Vec<oar_ocr::domain::structure::StructureResult> = Vec::new();
 
-    // Collect images and metadata for batch processing (cross-page formula batching)
+    // Collect images and metadata for configured batch processing.
     let mut images: Vec<image::RgbImage> = Vec::new();
     let mut source_meta: Vec<(String, String)> = Vec::new(); // (source_path, source_stem)
 
@@ -713,7 +729,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!(
-        "Batch processing {} image(s) with cross-page formula batching",
+        "Batch processing {} image(s) with configured batching",
         images.len()
     );
     let batch_results = analyzer.predict_images(images);

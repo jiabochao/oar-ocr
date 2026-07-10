@@ -6,13 +6,11 @@ use super::builder::PredictorBuilderState;
 use crate::TaskPredictorBuilder;
 use crate::core::OcrResult;
 use crate::core::traits::OrtConfigurable;
-use crate::core::traits::adapter::AdapterBuilder;
 use crate::core::traits::task::ImageTaskInput;
 use crate::domain::adapters::SealTextDetectionAdapterBuilder;
 use crate::domain::tasks::seal_text_detection::{SealTextDetectionConfig, SealTextDetectionTask};
 use crate::predictors::TaskPredictorCore;
 use image::RgbImage;
-use std::path::Path;
 
 /// Seal text detection prediction result
 #[derive(Debug, Clone)]
@@ -64,7 +62,10 @@ impl SealTextDetectionPredictorBuilder {
         self
     }
 
-    pub fn build<P: AsRef<Path>>(self, model_path: P) -> OcrResult<SealTextDetectionPredictor> {
+    pub fn build(
+        self,
+        model_source: impl Into<crate::core::ModelSource>,
+    ) -> OcrResult<SealTextDetectionPredictor> {
         let (config, ort_config) = self.state.into_parts();
         let mut adapter_builder =
             SealTextDetectionAdapterBuilder::new().with_config(config.clone());
@@ -73,7 +74,7 @@ impl SealTextDetectionPredictorBuilder {
             adapter_builder = adapter_builder.with_ort_config(ort_cfg);
         }
 
-        let adapter = Box::new(adapter_builder.build(model_path.as_ref())?);
+        let adapter = super::build_adapter(adapter_builder, model_source)?;
         let task = SealTextDetectionTask::with_config(config.clone());
         Ok(SealTextDetectionPredictor {
             core: TaskPredictorCore::new(adapter, task, config),
