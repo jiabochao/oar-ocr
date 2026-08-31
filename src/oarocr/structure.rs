@@ -4,7 +4,10 @@
 //! analysis pipelines that can detect layout elements, recognize tables, extract formulas,
 //! and optionally integrate OCR for text extraction.
 
-use super::builder_utils::{build_optional_adapter, resolve_model_path, resolve_model_source};
+use super::builder_utils::{
+    build_optional_adapter, default_cpu_region_batch_size, resolve_device_batch_sizes,
+    resolve_model_path, resolve_model_source,
+};
 use oar_ocr_core::core::config::OrtSessionConfig;
 use oar_ocr_core::core::traits::OrtConfigurable;
 use oar_ocr_core::core::traits::adapter::{AdapterBuilder, ModelAdapter};
@@ -20,12 +23,13 @@ use oar_ocr_core::domain::adapters::{
     TextRecognitionAdapterBuilder, UVDocRectifierAdapter, UVDocRectifierAdapterBuilder,
     UniMERNetAdapterBuilder,
 };
-use oar_ocr_core::domain::structure::{StructureResult, TableResult};
+use oar_ocr_core::domain::structure::{StructureResult, TableResult, TableType};
 use oar_ocr_core::domain::tasks::{
     FormulaRecognitionConfig, LayoutDetectionConfig, TableCellDetectionConfig,
     TableClassificationConfig, TableStructureRecognitionConfig, TextDetectionConfig,
     TextRecognitionConfig,
 };
+use oar_ocr_core::predictors::FormulaModelKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -107,13 +111,13 @@ struct StructurePipeline {
 /// use oar_ocr::oarocr::structure::OARStructureBuilder;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let structure = OARStructureBuilder::new("models/layout.onnx")
-///     .with_table_classification("models/table_cls.onnx")
-///     .with_table_cell_detection("models/table_cell.onnx", "wired")
-///     .with_table_structure_recognition("models/table_struct.onnx", "wired")
+/// let structure = OARStructureBuilder::new("layout.onnx")
+///     .with_table_classification("table_cls.onnx")
+///     .with_table_cell_detection("table_cell.onnx", "wired")
+///     .with_table_structure_recognition("table_struct.onnx", "wired")
 ///     .with_formula_recognition(
-///         "models/formula.onnx",
-///         "models/tokenizer.json",
+///         "formula.onnx",
+///         "tokenizer.json",
 ///         "pp_formulanet"
 ///     )
 ///     .build()?;
@@ -138,9 +142,9 @@ pub struct OARStructureBuilder {
     table_classification_model: Option<ModelSource>,
     table_orientation_model: Option<ModelSource>, // Reuses doc orientation model for rotated tables
     table_cell_detection_model: Option<ModelSource>,
-    table_cell_detection_type: Option<String>, // "wired" or "wireless"
+    table_cell_detection_type: Option<Result<TableType, String>>,
     table_structure_recognition_model: Option<ModelSource>,
-    table_structure_recognition_type: Option<String>, // "wired" or "wireless"
+    table_structure_recognition_type: Option<Result<TableType, String>>,
     table_structure_dict_path: Option<PathBuf>,
 
     wired_table_structure_model: Option<ModelSource>,
@@ -158,7 +162,7 @@ pub struct OARStructureBuilder {
 
     // Optional formula recognition
     formula_recognition_model: Option<ModelSource>,
-    formula_recognition_type: Option<String>, // "pp_formulanet" or "unimernet"
+    formula_recognition_type: Option<Result<FormulaModelKind, String>>,
     formula_tokenizer_path: Option<PathBuf>,
     formula_ort_session_config: Option<OrtSessionConfig>,
 
@@ -350,7 +354,8 @@ impl OARStructureBuilder {
     /// Sets the batch size for image-level processing.
     ///
     /// Controls how many pages are processed together by image-level stages such as
-    /// layout detection, region detection, and OCR text detection.
+    /// layout detection, region detection, and OCR text detection. When unset, CPU
+    /// execution uses `1`; explicitly configured accelerators retain adapter defaults.
     pub fn image_batch_size(mut self, size: usize) -> Self {
         self.image_batch_size = Some(size);
         self
@@ -359,7 +364,9 @@ impl OARStructureBuilder {
     /// Sets the batch size for region-level processing (text recognition).
     ///
     /// Controls how many text regions are processed together during OCR recognition.
-    /// Larger values improve throughput but use more memory.
+    /// When unset, CPU execution uses `16` for PP-OCRv6 Tiny and `4` for other
+    /// recognizers; explicitly configured accelerators retain their larger
+    /// throughput-oriented default.
     pub fn region_batch_size(mut self, size: usize) -> Self {
         self.region_batch_size = Some(size);
         self
@@ -484,14 +491,14 @@ impl OARStructureBuilder {
     /// # Arguments
     ///
     /// * `model_path` - Path to the table cell detection model
-    /// * `cell_type` - Type of cells to detect: "wired" or "wireless"
+    /// * `cell_type` - `"wired"`, `"wireless"`, or the corresponding [`TableType`]
     pub fn with_table_cell_detection(
         mut self,
         model_source: impl Into<ModelSource>,
-        cell_type: impl Into<String>,
+        cell_type: impl AsRef<str>,
     ) -> Self {
         self.table_cell_detection_model = Some(model_source.into());
-        self.table_cell_detection_type = Some(cell_type.into());
+        self.table_cell_detection_type = Some(cell_type.as_ref().parse());
         self
     }
 
@@ -506,16 +513,16 @@ impl OARStructureBuilder {
     /// # Arguments
     ///
     /// * `model_path` - Path to the table structure recognition model
-    /// * `table_type` - Type of table structure: "wired" or "wireless"
+    /// * `table_type` - `"wired"`, `"wireless"`, or the corresponding [`TableType`]
     ///
     /// This component recognizes the structure of tables and outputs HTML.
     pub fn with_table_structure_recognition(
         mut self,
         model_source: impl Into<ModelSource>,
-        table_type: impl Into<String>,
+        table_type: impl AsRef<str>,
     ) -> Self {
         self.table_structure_recognition_model = Some(model_source.into());
-        self.table_structure_recognition_type = Some(table_type.into());
+        self.table_structure_recognition_type = Some(table_type.as_ref().parse());
         self
     }
 
@@ -584,18 +591,19 @@ impl OARStructureBuilder {
     ///
     /// * `model_path` - Path to the formula recognition model
     /// * `tokenizer_path` - Path to the tokenizer JSON file
-    /// * `model_type` - Type of formula model: "pp_formulanet" or "unimernet"
+    /// * `model_type` - `"pp_formulanet"`, `"unimernet"`, or the corresponding
+    ///   [`FormulaModelKind`]
     ///
     /// This component recognizes mathematical formulas and outputs LaTeX.
     pub fn with_formula_recognition(
         mut self,
         model_source: impl Into<ModelSource>,
         tokenizer_path: impl Into<PathBuf>,
-        model_type: impl Into<String>,
+        model_type: impl AsRef<str>,
     ) -> Self {
         self.formula_recognition_model = Some(model_source.into());
         self.formula_tokenizer_path = Some(tokenizer_path.into());
-        self.formula_recognition_type = Some(model_type.into());
+        self.formula_recognition_type = Some(model_type.as_ref().parse());
         self
     }
 
@@ -661,6 +669,33 @@ impl OARStructureBuilder {
     ///
     /// This method instantiates all adapters and returns a ready-to-use structure analyzer.
     pub fn build(mut self) -> Result<OARStructure, OCRError> {
+        for (component, selection) in [
+            ("table_cell_detection", &self.table_cell_detection_type),
+            (
+                "table_structure_recognition",
+                &self.table_structure_recognition_type,
+            ),
+        ] {
+            match selection {
+                Some(Err(message)) => {
+                    return Err(OCRError::config_error_detailed(component, message.clone()));
+                }
+                Some(Ok(TableType::Unknown)) => {
+                    return Err(OCRError::config_error_detailed(
+                        component,
+                        "'unknown' is not valid when selecting a table model".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(Err(message)) = self.formula_recognition_type.as_ref() {
+            return Err(OCRError::config_error_detailed(
+                "formula_recognition",
+                message.clone(),
+            ));
+        }
+
         if let Some(size) = self.image_batch_size {
             Self::validate_batch_size("image_batch_size", size)?;
         }
@@ -730,6 +765,18 @@ impl OARStructureBuilder {
         resolve_opt_source(&mut self.text_line_orientation_model)?;
         resolve_opt_source(&mut self.text_recognition_model)?;
         resolve_opt_path(&mut self.character_dict_path)?;
+
+        let cpu_region_batch_size = default_cpu_region_batch_size(
+            self.text_recognition_model.as_ref(),
+            self.text_recognition_model_name.as_deref(),
+        );
+        (self.image_batch_size, self.region_batch_size) = resolve_device_batch_sizes(
+            self.ort_session_config.as_ref(),
+            self.image_batch_size,
+            self.region_batch_size,
+            1,
+            cpu_region_batch_size,
+        );
 
         // Load character dictionary if OCR is enabled
         let char_dict = if let Some(ref dict_path) = self.character_dict_path {
@@ -878,20 +925,26 @@ impl OARStructureBuilder {
         let table_cell_detection_adapter = if let Some(ref model_path) =
             self.table_cell_detection_model
         {
-            let cell_type = self.table_cell_detection_type.as_deref().unwrap_or("wired");
+            let cell_type = match self.table_cell_detection_type.as_ref() {
+                Some(Ok(cell_type)) => *cell_type,
+                Some(Err(message)) => {
+                    return Err(OCRError::config_error_detailed(
+                        "table_cell_detection",
+                        message.clone(),
+                    ));
+                }
+                None => TableType::Wired,
+            };
 
             use oar_ocr_core::domain::adapters::table_cell_detection_adapter::TableCellModelConfig;
 
             let model_config = match cell_type {
-                "wired" => TableCellModelConfig::rtdetr_l_wired_table_cell_det(),
-                "wireless" => TableCellModelConfig::rtdetr_l_wireless_table_cell_det(),
-                _ => {
+                TableType::Wired => TableCellModelConfig::rtdetr_l_wired_table_cell_det(),
+                TableType::Wireless => TableCellModelConfig::rtdetr_l_wireless_table_cell_det(),
+                TableType::Unknown => {
                     return Err(OCRError::config_error_detailed(
                         "table_cell_detection",
-                        format!(
-                            "Invalid cell type '{}': must be 'wired' or 'wireless'",
-                            cell_type
-                        ),
+                        "TableType::Unknown is not valid for a table cell detector".to_string(),
                     ));
                 }
             };
@@ -915,10 +968,16 @@ impl OARStructureBuilder {
         let table_structure_recognition_adapter = if let Some(ref model_path) =
             self.table_structure_recognition_model
         {
-            let table_type = self
-                .table_structure_recognition_type
-                .as_deref()
-                .unwrap_or("wired");
+            let table_type = match self.table_structure_recognition_type.as_ref() {
+                Some(Ok(table_type)) => *table_type,
+                Some(Err(message)) => {
+                    return Err(OCRError::config_error_detailed(
+                        "table_structure_recognition",
+                        message.clone(),
+                    ));
+                }
+                None => TableType::Wired,
+            };
             let dict_path = self
                     .table_structure_dict_path
                     .clone()
@@ -930,7 +989,7 @@ impl OARStructureBuilder {
                     })?;
 
             let adapter: TableStructureRecognitionAdapter = match table_type {
-                "wired" => {
+                TableType::Wired => {
                     let mut builder = SLANetWiredAdapterBuilder::new().dict_path(dict_path.clone());
 
                     if let Some(ref config) = self.table_structure_recognition_config {
@@ -943,7 +1002,7 @@ impl OARStructureBuilder {
 
                     builder.build(model_path)?
                 }
-                "wireless" => {
+                TableType::Wireless => {
                     let mut builder =
                         SLANetWirelessAdapterBuilder::new().dict_path(dict_path.clone());
 
@@ -957,13 +1016,11 @@ impl OARStructureBuilder {
 
                     builder.build(model_path)?
                 }
-                _ => {
+                TableType::Unknown => {
                     return Err(OCRError::config_error_detailed(
                         "table_structure_recognition",
-                        format!(
-                            "Invalid table type '{}': must be 'wired' or 'wireless'",
-                            table_type
-                        ),
+                        "TableType::Unknown is not valid for table structure recognition"
+                            .to_string(),
                     ));
                 }
             };
@@ -1084,77 +1141,76 @@ impl OARStructureBuilder {
         };
 
         // Build formula recognition adapter if enabled
-        let formula_recognition_adapter = if let Some(ref model_path) =
-            self.formula_recognition_model
-        {
-            let tokenizer_path = self.formula_tokenizer_path.as_ref().ok_or_else(|| {
-                OCRError::config_error_detailed(
-                    "formula_recognition",
-                    "Tokenizer path is required for formula recognition".to_string(),
-                )
-            })?;
-
-            let model_type = self.formula_recognition_type.as_deref().ok_or_else(|| {
-                OCRError::config_error_detailed(
-                    "formula_recognition",
-                    "Model type is required (must be 'pp_formulanet' or 'unimernet')".to_string(),
-                )
-            })?;
-
-            let adapter: FormulaRecognitionAdapter = match model_type.to_lowercase().as_str() {
-                "pp_formulanet" | "pp-formulanet" => {
-                    let mut builder = PPFormulaNetAdapterBuilder::new();
-
-                    builder = builder.tokenizer_path(tokenizer_path);
-
-                    if let Some(ref config) = self.formula_recognition_config {
-                        builder = builder.task_config(config.clone());
-                    }
-
-                    if let Some(ort_config) = self
-                        .formula_ort_session_config
-                        .as_ref()
-                        .or(self.ort_session_config.as_ref())
-                    {
-                        builder = builder.with_ort_config(ort_config.clone());
-                    }
-
-                    builder.build(model_path)?
-                }
-                "unimernet" => {
-                    let mut builder = UniMERNetAdapterBuilder::new();
-
-                    builder = builder.tokenizer_path(tokenizer_path);
-
-                    if let Some(ref config) = self.formula_recognition_config {
-                        builder = builder.task_config(config.clone());
-                    }
-
-                    if let Some(ort_config) = self
-                        .formula_ort_session_config
-                        .as_ref()
-                        .or(self.ort_session_config.as_ref())
-                    {
-                        builder = builder.with_ort_config(ort_config.clone());
-                    }
-
-                    builder.build(model_path)?
-                }
-                _ => {
-                    return Err(OCRError::config_error_detailed(
+        let formula_recognition_adapter =
+            if let Some(ref model_path) = self.formula_recognition_model {
+                let tokenizer_path = self.formula_tokenizer_path.as_ref().ok_or_else(|| {
+                    OCRError::config_error_detailed(
                         "formula_recognition",
-                        format!(
-                            "Invalid model type '{}': must be 'pp_formulanet' or 'unimernet'",
-                            model_type
-                        ),
-                    ));
-                }
-            };
+                        "Tokenizer path is required for formula recognition".to_string(),
+                    )
+                })?;
 
-            Some(adapter)
-        } else {
-            None
-        };
+                let model_type = match self.formula_recognition_type.as_ref() {
+                    Some(Ok(model_type)) => *model_type,
+                    Some(Err(message)) => {
+                        return Err(OCRError::config_error_detailed(
+                            "formula_recognition",
+                            message.clone(),
+                        ));
+                    }
+                    None => {
+                        return Err(OCRError::config_error_detailed(
+                            "formula_recognition",
+                            "Formula model kind is required".to_string(),
+                        ));
+                    }
+                };
+
+                let adapter: FormulaRecognitionAdapter = match model_type {
+                    FormulaModelKind::PPFormulaNet => {
+                        let mut builder = PPFormulaNetAdapterBuilder::new();
+
+                        builder = builder.tokenizer_path(tokenizer_path);
+
+                        if let Some(ref config) = self.formula_recognition_config {
+                            builder = builder.task_config(config.clone());
+                        }
+
+                        if let Some(ort_config) = self
+                            .formula_ort_session_config
+                            .as_ref()
+                            .or(self.ort_session_config.as_ref())
+                        {
+                            builder = builder.with_ort_config(ort_config.clone());
+                        }
+
+                        builder.build(model_path)?
+                    }
+                    FormulaModelKind::UniMERNet => {
+                        let mut builder = UniMERNetAdapterBuilder::new();
+
+                        builder = builder.tokenizer_path(tokenizer_path);
+
+                        if let Some(ref config) = self.formula_recognition_config {
+                            builder = builder.task_config(config.clone());
+                        }
+
+                        if let Some(ort_config) = self
+                            .formula_ort_session_config
+                            .as_ref()
+                            .or(self.ort_session_config.as_ref())
+                        {
+                            builder = builder.with_ort_config(ort_config.clone());
+                        }
+
+                        builder.build(model_path)?
+                    }
+                };
+
+                Some(adapter)
+            } else {
+                None
+            };
 
         // Build seal text detection adapter if enabled
         let seal_text_detection_adapter =
@@ -1946,12 +2002,12 @@ impl OARStructure {
         let crop_count = bboxes.len();
         let mut formula_results = Vec::with_capacity(crop_count);
         let mut score_results = Vec::with_capacity(crop_count);
-        let mut remaining_crops = crops;
-        while !remaining_crops.is_empty() {
-            let chunk_len = batch_size.min(remaining_crops.len());
-            let rest = remaining_crops.split_off(chunk_len);
-            let chunk_vec = remaining_crops;
-            remaining_crops = rest;
+        let mut remaining_crops = crops.into_iter();
+        loop {
+            let chunk_vec: Vec<_> = remaining_crops.by_ref().take(batch_size).collect();
+            if chunk_vec.is_empty() {
+                break;
+            }
 
             let output = formula_adapter.execute(ImageTaskInput::new(chunk_vec), None)?;
             formula_results.extend(output.formulas);
@@ -2387,10 +2443,12 @@ impl OARStructure {
                 let mut rec_batches = 0usize;
                 let t_text_rec = Instant::now();
 
-                while !items.is_empty() {
-                    let take_n = batch_size.min(items.len());
-                    let batch_items: Vec<(usize, f32, image::RgbImage)> =
-                        items.drain(0..take_n).collect();
+                let mut remaining_items = items.into_iter();
+                loop {
+                    let batch_items: Vec<_> = remaining_items.by_ref().take(batch_size).collect();
+                    if batch_items.is_empty() {
+                        break;
+                    }
 
                     let mut det_indices: Vec<usize> = Vec::with_capacity(batch_items.len());
                     let mut rec_imgs: Vec<image::RgbImage> = Vec::with_capacity(batch_items.len());
@@ -2838,7 +2896,7 @@ impl OARStructure {
             page_idx: usize,
             det_idx: usize,
             wh_ratio: f32,
-            image: image::RgbImage,
+            image: Arc<image::RgbImage>,
         }
 
         let mut page_states: Vec<Option<PageOcrState>> =
@@ -2873,10 +2931,17 @@ impl OARStructure {
             det_images.push(ocr_image);
         }
 
-        while !det_images.is_empty() {
-            let take_n = image_batch_size.min(det_images.len());
-            let batch_images: Vec<_> = det_images.drain(0..take_n).collect();
-            let batch_page_indices: Vec<_> = det_page_indices.drain(0..take_n).collect();
+        let mut remaining_pages = det_page_indices.into_iter().zip(det_images);
+        loop {
+            let mut batch_page_indices = Vec::with_capacity(image_batch_size);
+            let mut batch_images = Vec::with_capacity(image_batch_size);
+            for (page_idx, image) in remaining_pages.by_ref().take(image_batch_size) {
+                batch_page_indices.push(page_idx);
+                batch_images.push(image);
+            }
+            if batch_page_indices.is_empty() {
+                break;
+            }
             match text_detection_adapter.execute(ImageTaskInput::new(batch_images), None) {
                 Ok(det_result) => {
                     for (offset, detections) in det_result.detections.into_iter().enumerate() {
@@ -3043,13 +3108,12 @@ impl OARStructure {
                             let Some(img) = crop_result else {
                                 continue;
                             };
-                            let image = (*img).clone();
-                            let wh_ratio = image.width() as f32 / image.height().max(1) as f32;
+                            let wh_ratio = img.width() as f32 / img.height().max(1) as f32;
                             rec_items.push(RecItem {
                                 page_idx,
                                 det_idx,
                                 wh_ratio,
-                                image,
+                                image: img,
                             });
                         }
                     }
@@ -3069,8 +3133,12 @@ impl OARStructure {
         if !rec_items.is_empty() {
             if let Some(ref tlo_adapter) = self.pipeline.text_line_orientation_adapter {
                 let t_tlo = Instant::now();
-                let input =
-                    ImageTaskInput::new(rec_items.iter().map(|item| item.image.clone()).collect());
+                let input = ImageTaskInput::from_arc_images(
+                    rec_items
+                        .iter()
+                        .map(|item| Arc::clone(&item.image))
+                        .collect(),
+                );
                 match tlo_adapter.execute(input, None) {
                     Ok(tlo_result) => {
                         for (item, classifications) in
@@ -3079,7 +3147,7 @@ impl OARStructure {
                             if let Some(top_cls) = classifications.first()
                                 && top_cls.class_id == 1
                             {
-                                item.image = image::imageops::rotate180(&item.image);
+                                item.image = Arc::new(image::imageops::rotate180(&*item.image));
                             }
                         }
                     }
@@ -3110,8 +3178,9 @@ impl OARStructure {
             while start < rec_items.len() {
                 let end = (start + batch_size).min(rec_items.len());
                 let chunk = &rec_items[start..end];
-                let rec_input =
-                    ImageTaskInput::new(chunk.iter().map(|item| item.image.clone()).collect());
+                let rec_input = ImageTaskInput::from_arc_images(
+                    chunk.iter().map(|item| Arc::clone(&item.image)).collect(),
+                );
                 match text_recognition_adapter.execute(rec_input, None) {
                     Ok(rec_result) => {
                         for (i, item) in chunk.iter().enumerate() {
@@ -3388,14 +3457,15 @@ impl OARStructure {
 
             if !all_crops.is_empty() {
                 let batch_size = formula_adapter.recommended_batch_size().max(1);
-                let mut remaining_crops = all_crops;
+                let mut remaining_crops = all_crops.into_iter();
                 let mut meta_offset = 0;
 
-                while !remaining_crops.is_empty() {
-                    let chunk_len = batch_size.min(remaining_crops.len());
-                    let rest = remaining_crops.split_off(chunk_len);
-                    let chunk_vec = remaining_crops;
-                    remaining_crops = rest;
+                loop {
+                    let chunk_vec: Vec<_> = remaining_crops.by_ref().take(batch_size).collect();
+                    let chunk_len = chunk_vec.len();
+                    if chunk_len == 0 {
+                        break;
+                    }
 
                     let chunk_meta = &crop_meta[meta_offset..meta_offset + chunk_len];
                     match formula_adapter.execute(ImageTaskInput::new(chunk_vec), None) {
@@ -3460,10 +3530,10 @@ mod tests {
 
     #[test]
     fn test_structure_builder_new() {
-        let builder = OARStructureBuilder::new("models/layout.onnx");
+        let builder = OARStructureBuilder::new("layout.onnx");
         assert_eq!(
             builder.layout_detection_model.as_path(),
-            Some(std::path::Path::new("models/layout.onnx"))
+            Some(std::path::Path::new("layout.onnx"))
         );
         assert!(builder.table_classification_model.is_none());
         assert!(builder.formula_recognition_model.is_none());
@@ -3471,49 +3541,100 @@ mod tests {
 
     #[test]
     fn test_structure_builder_with_table_components() {
-        let builder = OARStructureBuilder::new("models/layout.onnx")
-            .with_table_classification("models/table_cls.onnx")
-            .with_table_cell_detection("models/table_cell.onnx", "wired")
-            .with_table_structure_recognition("models/table_struct.onnx", "wired")
-            .table_structure_dict_path("models/table_structure_dict.txt");
+        let builder = OARStructureBuilder::new("layout.onnx")
+            .with_table_classification("table_cls.onnx")
+            .with_table_cell_detection("table_cell.onnx", TableType::Wired)
+            .with_table_structure_recognition("table_struct.onnx", TableType::Wired)
+            .table_structure_dict_path("table_structure_dict.txt");
 
         assert!(builder.table_classification_model.is_some());
         assert!(builder.table_cell_detection_model.is_some());
         assert!(builder.table_structure_recognition_model.is_some());
-        assert_eq!(builder.table_cell_detection_type, Some("wired".to_string()));
+        assert_eq!(
+            builder.table_cell_detection_type,
+            Some(Ok(TableType::Wired))
+        );
         assert_eq!(
             builder.table_structure_recognition_type,
-            Some("wired".to_string())
+            Some(Ok(TableType::Wired))
         );
         assert_eq!(
             builder.table_structure_dict_path,
-            Some(PathBuf::from("models/table_structure_dict.txt"))
+            Some(PathBuf::from("table_structure_dict.txt"))
         );
     }
 
     #[test]
     fn test_structure_builder_with_formula() {
-        let builder = OARStructureBuilder::new("models/layout.onnx").with_formula_recognition(
-            "models/formula.onnx",
-            "models/tokenizer.json",
-            "pp_formulanet",
+        let builder = OARStructureBuilder::new("layout.onnx").with_formula_recognition(
+            "formula.onnx",
+            "tokenizer.json",
+            FormulaModelKind::PPFormulaNet,
         );
 
         assert!(builder.formula_recognition_model.is_some());
         assert!(builder.formula_tokenizer_path.is_some());
         assert_eq!(
             builder.formula_recognition_type,
-            Some("pp_formulanet".to_string())
+            Some(Ok(FormulaModelKind::PPFormulaNet))
         );
     }
 
     #[test]
-    fn test_structure_builder_with_ocr() {
-        let builder = OARStructureBuilder::new("models/layout.onnx").with_ocr(
-            "models/det.onnx",
-            "models/rec.onnx",
-            "models/dict.txt",
+    fn test_structure_builder_accepts_strict_string_kinds() {
+        let builder = OARStructureBuilder::new("layout.onnx")
+            .with_table_cell_detection("table_cell.onnx", "wireless")
+            .with_table_structure_recognition("table_struct.onnx", "wired")
+            .with_formula_recognition("formula.onnx", "tokenizer.json", "pp_formulanet");
+
+        assert_eq!(
+            builder.table_cell_detection_type,
+            Some(Ok(TableType::Wireless))
         );
+        assert_eq!(
+            builder.table_structure_recognition_type,
+            Some(Ok(TableType::Wired))
+        );
+        assert_eq!(
+            builder.formula_recognition_type,
+            Some(Ok(FormulaModelKind::PPFormulaNet))
+        );
+    }
+
+    #[test]
+    fn test_structure_builder_preserves_invalid_string_kinds() {
+        let builder = OARStructureBuilder::new("layout.onnx")
+            .with_table_cell_detection("table_cell.onnx", "border-ish")
+            .with_formula_recognition("formula.onnx", "tokenizer.json", "mystery");
+
+        assert!(matches!(
+            builder.table_cell_detection_type,
+            Some(Err(ref message)) if message.contains("border-ish")
+        ));
+        assert!(matches!(
+            builder.formula_recognition_type,
+            Some(Err(ref message)) if message.contains("mystery")
+        ));
+    }
+
+    #[test]
+    fn test_structure_builder_reports_invalid_string_before_loading_models() {
+        let result = OARStructureBuilder::new("missing-layout.onnx")
+            .with_table_cell_detection("missing-table.onnx", "border-ish")
+            .build();
+        let error = match result {
+            Ok(_) => panic!("invalid selector must fail"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("table_cell_detection"));
+        assert!(message.contains("border-ish"));
+    }
+
+    #[test]
+    fn test_structure_builder_with_ocr() {
+        let builder =
+            OARStructureBuilder::new("layout.onnx").with_ocr("det.onnx", "rec.onnx", "dict.txt");
 
         assert!(builder.text_detection_model.is_some());
         assert!(builder.text_recognition_model.is_some());
@@ -3528,7 +3649,7 @@ mod tests {
             ..Default::default()
         };
 
-        let builder = OARStructureBuilder::new("models/layout.onnx")
+        let builder = OARStructureBuilder::new("layout.onnx")
             .layout_detection_config(layout_config.clone())
             .image_batch_size(4)
             .region_batch_size(64);

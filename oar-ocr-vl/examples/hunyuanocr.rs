@@ -1,6 +1,7 @@
-//! HunyuanOCR Recognition Example (Candle-based)
+//! HunyuanOCR 1.5 / 1.0 Recognition Example (Candle-based)
 //!
-//! This example demonstrates how to run `tencent/HunyuanOCR` (HunYuanVL) in Rust.
+//! This example demonstrates how to run `tencent/HunyuanOCR` (1.5 at the model
+//! repository root, or archived 1.0 under `v1.0/`) in Rust.
 //!
 //! # Usage
 //!
@@ -12,7 +13,7 @@
 //!
 //! ```bash
 //! cargo run -p oar-ocr-vl --example hunyuanocr -- \\
-//!     --model-dir models/HunyuanOCR \\
+//!     --model-dir tencent/HunyuanOCR \\
 //!     --prompt "Detect and recognize text in the image, and output the text coordinates in a formatted manner." \\
 //!     document.jpg
 //! ```
@@ -21,20 +22,26 @@ mod utils;
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::Instant;
 use tracing::{error, info};
 
-use oar_ocr_core::utils::load_image;
 use oar_ocr_vl::HunyuanOcr;
+use oar_ocr_vl::utils::image::load_image;
 use oar_ocr_vl::utils::parse_device;
+use utils::token_fingerprint;
 
 #[derive(Parser)]
 #[command(name = "hunyuanocr")]
-#[command(about = "HunyuanOCR Recognition Example - image-to-text using Candle")]
+#[command(about = "HunyuanOCR 1.5/1.0 - image-to-text using Candle")]
 struct Args {
     /// Path to the HunyuanOCR model directory
     #[arg(short, long)]
     model_dir: PathBuf,
+
+    /// Optional DFlash draft directory (official checkpoint: <model-dir>/dflash)
+    #[arg(long)]
+    dflash_dir: Option<PathBuf>,
 
     /// Paths to input images to process
     #[arg(required = true)]
@@ -48,12 +55,20 @@ struct Args {
     #[arg(long, default_value = "4096")]
     max_tokens: usize,
 
+    /// Override repetition penalty (1.0 matches the official speed benchmark)
+    #[arg(long)]
+    repetition_penalty: Option<f64>,
+
     /// Instruction prompt (default: text spotting)
     #[arg(
         long,
         default_value = "Detect and recognize text in the image, and output the text coordinates in a formatted manner."
     )]
     prompt: String,
+
+    /// Suppress generated text and print aggregate timing/token statistics
+    #[arg(long)]
+    benchmark: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -89,13 +104,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.model_dir.display()
     );
     let load_start = Instant::now();
-    let model = HunyuanOcr::from_dir(&args.model_dir, device)?;
+    let mut model = match &args.dflash_dir {
+        Some(dflash_dir) => {
+            if !dflash_dir.exists() {
+                return Err(format!("DFlash directory not found: {}", dflash_dir.display()).into());
+            }
+            HunyuanOcr::from_dirs(&args.model_dir, dflash_dir, device)?
+        }
+        None => HunyuanOcr::from_dir(&args.model_dir, device)?,
+    };
+    if let Some(penalty) = args.repetition_penalty {
+        model.set_repetition_penalty(penalty)?;
+    }
     info!(
-        "Model loaded in {:.2}ms",
-        load_start.elapsed().as_secs_f64() * 1000.0
+        "HunyuanOCR {} loaded in {:.2}ms{}, repetition penalty {:.3}",
+        model.version(),
+        load_start.elapsed().as_secs_f64() * 1000.0,
+        model
+            .dflash_num_speculative_tokens()
+            .map(|n| format!(", DFlash enabled ({n} speculative tokens)"))
+            .unwrap_or_default(),
+        model.repetition_penalty(),
     );
 
     info!("\n=== Processing {} images ===", existing_images.len());
+    let mut total_inference = Duration::ZERO;
+    let mut total_tokens = 0usize;
+    let mut succeeded = 0usize;
     for image_path in &existing_images {
         info!("\nProcessing: {}", image_path.display());
         let rgb_img = match load_image(image_path) {
@@ -107,20 +142,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let infer_start = Instant::now();
-        match model
-            .generate(&[rgb_img], &[args.prompt.as_str()], args.max_tokens)
-            .pop()
-        {
-            Some(Ok(result)) => {
+        match model.generate_tokens(&[rgb_img], &[args.prompt.as_str()], args.max_tokens) {
+            Ok(mut results) if !results.is_empty() => {
+                let tokens = results.remove(0);
+                let elapsed = infer_start.elapsed();
+                total_inference += elapsed;
+                total_tokens += tokens.len();
+                succeeded += 1;
                 info!(
-                    "  Inference time: {:.2}ms",
-                    infer_start.elapsed().as_secs_f64() * 1000.0
+                    "  Inference time: {:.2}ms, tokens: {}, fingerprint: {:016x}",
+                    elapsed.as_secs_f64() * 1000.0,
+                    tokens.len(),
+                    token_fingerprint(&tokens)
                 );
-                println!("{}", result);
+                if !args.benchmark {
+                    println!("{}", model.decode_tokens(&tokens)?);
+                }
             }
-            Some(Err(e)) => error!("  Inference failed: {}", e),
-            None => error!("  No result returned from model"),
+            Ok(_) => error!("  No result returned from model"),
+            Err(e) => error!("  Inference failed: {}", e),
         }
+    }
+
+    if succeeded > 0 {
+        info!(
+            "Benchmark summary: pages={}, total={:.2}ms, avg={:.2}ms/page, tokens={}, throughput={:.2} tokens/s",
+            succeeded,
+            total_inference.as_secs_f64() * 1000.0,
+            total_inference.as_secs_f64() * 1000.0 / succeeded as f64,
+            total_tokens,
+            total_tokens as f64 / total_inference.as_secs_f64()
+        );
     }
 
     Ok(())

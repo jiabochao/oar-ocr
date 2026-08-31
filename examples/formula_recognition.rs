@@ -37,8 +37,8 @@
 //! Basic usage:
 //! ```bash
 //! cargo run --example formula_recognition -- \
-//!     -m models/PP-FormulaNet_plus-M/inference.onnx \
-//!     -t models/PP-FormulaNet_plus-M/tokenizer.json \
+//!     -m pp-formulanet_plus-m.onnx \
+//!     -t pp-formulanet-tokenizer.json \
 //!     --model-name "PP-FormulaNet_plus-M" \
 //!     formula1.jpg formula2.jpg
 //! ```
@@ -46,8 +46,8 @@
 //! With visualization:
 //! ```bash
 //! cargo run --release --example formula_recognition -- \
-//!     -m models/unimernet.onnx \
-//!     -t models/unimernet_tokenizer.json \
+//!     -m unimernet.onnx \
+//!     -t unimernet_tokenizer.json \
 //!     --model-name UniMERNet \
 //!     -o output/ --vis \
 //!     formula1.jpg formula2.jpg
@@ -111,7 +111,7 @@ struct Args {
 
     /// Model name to explicitly specify the model type (required for correct model detection).
     /// Supported: UniMERNet, PP-FormulaNet-S, PP-FormulaNet-L, PP-FormulaNet_plus-S, PP-FormulaNet_plus-M, PP-FormulaNet_plus-L
-    #[arg(long, default_value = "FormulaRecognition")]
+    #[arg(long, default_value = "UniMERNet")]
     model_name: String,
 
     /// Enable verbose output

@@ -3,9 +3,6 @@
 #[allow(dead_code)]
 pub mod structure_match;
 
-#[allow(dead_code)]
-pub mod mineru_layout;
-
 /// Initializes the tracing subscriber for logging in examples.
 #[allow(dead_code)]
 pub fn init_tracing() {
@@ -18,6 +15,14 @@ pub fn init_tracing() {
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
+}
+
+/// Stable FNV-1a fingerprint used to compare generated token streams.
+#[allow(dead_code)]
+pub fn token_fingerprint(tokens: &[u32]) -> u64 {
+    tokens.iter().fold(0xcbf29ce484222325_u64, |hash, token| {
+        (hash ^ u64::from(*token)).wrapping_mul(0x100000001b3)
+    })
 }
 
 #[allow(dead_code)]

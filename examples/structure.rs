@@ -64,12 +64,12 @@
 //!
 //! # Examples
 //!
-//! ## Minimal (Layout Detection Only)
+//! ## Minimal Layout Detection
 //!
 //! ```bash
 //! cargo run --release --features cuda --example structure -- \
-//!   --layout-model models/PP-DocLayout_plus-L.onnx \
-//!   --region-model models/PP-DocBlockLayout.onnx \
+//!   --layout-model pp-doclayout_plus-l.onnx \
+//!   --region-model pp-docblocklayout.onnx \
 //!   document.jpg
 //! ```
 //!
@@ -77,11 +77,11 @@
 //!
 //! ```bash
 //! cargo run --release --features cuda --example structure -- \
-//!   --layout-model models/PP-DocLayout_plus-L.onnx \
-//!   --region-model models/PP-DocBlockLayout.onnx \
-//!   --text-det-model models/PP-OCRv5_server_det.onnx \
-//!   --text-rec-model models/PP-OCRv5_server_rec.onnx \
-//!   --text-dict-path models/ppocrv5_dict.txt \
+//!   --layout-model pp-doclayout_plus-l.onnx \
+//!   --region-model pp-docblocklayout.onnx \
+//!   --text-det-model pp-ocrv5_server_det.onnx \
+//!   --text-rec-model pp-ocrv5_server_rec.onnx \
+//!   --text-dict-path ppocrv5_dict.txt \
 //!   document.jpg
 //! ```
 //!
@@ -89,7 +89,7 @@
 //!
 //! ```bash
 //! cargo run --release --features cuda --example structure -- \
-//!   --layout-model models/PicoDet-L_layout_17cls.onnx \
+//!   --layout-model picodet-l_layout_17cls.onnx \
 //!   --layout-model-name PicoDet-L_layout_17cls \
 //!   document.jpg
 //! ```
@@ -98,29 +98,29 @@
 //!
 //! ```bash
 //! cargo run --release --features cuda --example structure -- \
-//!   --layout-model models/PP-DocLayout_plus-L.onnx \
-//!   --region-model models/PP-DocBlockLayout.onnx \
-//!   --orientation-model models/PP-LCNet_x1_0_doc_ori.onnx \
-//!   --rectification-model models/UVDoc.onnx \
-//!   --table-cls-model models/PP-LCNet_x1_0_table_cls.onnx \
-//!   --wired-structure-model models/SLANeXt_wired.onnx \
-//!   --wireless-structure-model models/SLANet_plus.onnx \
-//!   --wired-cell-model models/RT-DETR-L_wired_table_cell_det.onnx \
-//!   --wireless-cell-model models/RT-DETR-L_wireless_table_cell_det.onnx \
-//!   --table-structure-dict models/table_structure_dict_ch.txt \
-//!   --formula-model models/PP-FormulaNet_plus-L.onnx \
-//!   --formula-tokenizer models/pp_formulanet_tokenizer.json \
+//!   --layout-model pp-doclayout_plus-l.onnx \
+//!   --region-model pp-docblocklayout.onnx \
+//!   --orientation-model pp-lcnet_x1_0_doc_ori.onnx \
+//!   --rectification-model uvdoc.onnx \
+//!   --table-cls-model pp-lcnet_x1_0_table_cls.onnx \
+//!   --wired-structure-model slanext_wired.onnx \
+//!   --wireless-structure-model slanet_plus.onnx \
+//!   --wired-cell-model rt-detr-l_wired_table_cell_det.onnx \
+//!   --wireless-cell-model rt-detr-l_wireless_table_cell_det.onnx \
+//!   --table-structure-dict table_structure_dict_ch.txt \
+//!   --formula-model pp-formulanet_plus-l.onnx \
+//!   --formula-tokenizer pp-formulanet-tokenizer.json \
 //!   --formula-type pp_formulanet \
-//!   --seal-model models/PP-OCRv4_server_seal_det.onnx \
-//!   --text-det-model models/PP-OCRv5_server_det.onnx \
-//!   --text-rec-model models/PP-OCRv5_server_rec.onnx \
-//!   --text-dict-path models/ppocrv5_dict.txt \
+//!   --seal-model pp-ocrv4_server_seal_det.onnx \
+//!   --text-det-model pp-ocrv5_server_det.onnx \
+//!   --text-rec-model pp-ocrv5_server_rec.onnx \
+//!   --text-dict-path ppocrv5_dict.txt \
 //!   --to-json --to-markdown \
 //!   -o output/structure \
 //!   document.jpg
 //! ```
 //!
-//! # Model Reference (PP-StructureV3 Defaults)
+//! # PP-StructureV3 Default Model Reference
 //!
 //! | Component | Model Name | Model Path Arg | Model Name Arg |
 //! |-----------|------------|----------------|----------------|
@@ -144,6 +144,7 @@ mod utils;
 
 use clap::Parser;
 use image::RgbImage;
+use oar_ocr::core::OrtGlobalThreadPoolOptions;
 use oar_ocr::domain::structure::TableType;
 use oar_ocr::domain::tasks::{
     FormulaRecognitionConfig, LayoutDetectionConfig, TextDetectionConfig, TextRecognitionConfig,
@@ -152,8 +153,9 @@ use oar_ocr::oarocr::OARStructureBuilder;
 use oar_ocr::processors::LimitType;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{error, info, warn};
-use utils::device_config::parse_device_config;
+use utils::device_config::{apply_ort_overrides, parse_device_config};
 use utils::pdf::{PdfDocument, is_pdf_file};
 
 /// Command-line arguments for the structure analysis example
@@ -310,9 +312,17 @@ struct Args {
     textline_orientation_model: Option<PathBuf>,
 
     /// Device to use for inference (default: cuda)
-    /// Supported: cpu, cuda, cuda:0, cuda:1, etc.
+    /// Supported with matching features: cpu, cuda:N, directml:N.
     #[arg(long, default_value = "cuda")]
     device: String,
+
+    /// ONNX Runtime intra-op thread count (defaults to the runtime's CPU policy)
+    #[arg(long)]
+    intra_threads: Option<usize>,
+
+    /// Share one ONNX Runtime thread pool across all configured models
+    #[arg(long, default_value_t = false)]
+    global_thread_pool: bool,
 
     /// Number of pages/images to process per image-level batch
     #[arg(long = "image-batch-size")]
@@ -321,6 +331,22 @@ struct Args {
     /// Number of cropped regions to process per recognition batch
     #[arg(long = "region-batch-size")]
     region_batch_size: Option<usize>,
+
+    /// Repeat inference to expose warm-up and steady-state latency.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    repeat: u32,
+
+    /// ONNX Runtime intra-op worker threads (explicit tuning experiment).
+    #[arg(long)]
+    ort_intra_threads: Option<usize>,
+
+    /// ONNX Runtime inter-op worker threads (only useful with parallel execution).
+    #[arg(long)]
+    ort_inter_threads: Option<usize>,
+
+    /// Enable ONNX Runtime parallel graph execution.
+    #[arg(long)]
+    ort_parallel_execution: bool,
 
     /// Layout detection score threshold (varies by class, 0.3-0.5)
     #[arg(long, default_value = "0.5")]
@@ -577,6 +603,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         score_threshold: args.rec_score_thresh,
     };
 
+    if args.global_thread_pool {
+        let mut pool = OrtGlobalThreadPoolOptions::new();
+        if let Some(threads) = args.intra_threads {
+            pool = pool.with_intra_threads(threads);
+        }
+        if !pool.commit()? {
+            return Err("ONNX Runtime was initialized before the global thread pool".into());
+        }
+    }
+
     // Build structure pipeline
     let mut builder =
         OARStructureBuilder::new(&args.layout_model).layout_detection_config(layout_config);
@@ -584,7 +620,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Always set layout model name (has default value)
     builder = builder.layout_model_name(&args.layout_model_name);
 
-    if let Some(config) = parse_device_config(&args.device)? {
+    let mut ort_config = parse_device_config(&args.device)?;
+    if let Some(threads) = args.intra_threads
+        && !args.global_thread_pool
+    {
+        ort_config = Some(
+            ort_config
+                .take()
+                .unwrap_or_default()
+                .with_intra_threads(threads),
+        );
+    }
+    let ort_config = apply_ort_overrides(
+        ort_config,
+        args.ort_intra_threads,
+        args.ort_inter_threads,
+        args.ort_parallel_execution,
+    )?;
+    if let Some(config) = ort_config {
         builder = builder.ort_session(config);
     }
 
@@ -685,7 +738,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .text_recognition_config(text_rec_config);
     }
 
+    let build_start = Instant::now();
     let analyzer = builder.build()?;
+    info!(
+        "Structure pipeline built in {:.2}ms",
+        build_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Collect all results for potential concatenation
     let mut all_results: Vec<oar_ocr::domain::structure::StructureResult> = Vec::new();
@@ -732,7 +790,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Batch processing {} image(s) with configured batching",
         images.len()
     );
+    // Only the warm-up runs need a cloned image set; the final (or only) run
+    // can move `images` directly, so `--repeat 1` (the default) never pays a
+    // clone.
+    for iteration in 1..args.repeat {
+        let predict_start = Instant::now();
+        analyzer.predict_images(images.clone());
+        info!(
+            "Structure inference completed (run {}/{}) in {:.2}ms",
+            iteration,
+            args.repeat,
+            predict_start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    let predict_start = Instant::now();
     let batch_results = analyzer.predict_images(images);
+    info!(
+        "Structure inference completed (run {}/{}) in {:.2}ms",
+        args.repeat,
+        args.repeat,
+        predict_start.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Process each result: assign metadata, save, visualize, log
     for (idx, (page_result, (source_path, source_stem))) in

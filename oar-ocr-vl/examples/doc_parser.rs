@@ -3,9 +3,9 @@
 //! This example demonstrates the unified DocParser API for external
 //! layout-first document parsing (layout detection + region recognition).
 //!
-//! HunyuanOCR and MinerU2.5 are intentionally not exposed here:
-//! their reference-quality usage is full-page prompt-driven parsing or a
-//! model-native two-step pipeline, not forced external layout crops.
+//! HunyuanOCR and the MinerU models are intentionally not exposed here: their
+//! reference-quality usage is full-page prompt-driven parsing or a model-native
+//! two-step pipeline, not forced external layout crops.
 //!
 //! # Usage
 //!
@@ -13,22 +13,36 @@
 //! # Using PaddleOCR-VL model
 //! cargo run -p oar-ocr-vl --example doc_parser -- \
 //!     --model-name paddleocr-vl \
-//!     --model-dir PaddleOCR-VL \
-//!     --layout-model models/pp-doclayoutv3.onnx \
+//!     --model-dir PaddlePaddle/PaddleOCR-VL \
+//!     --layout-dir PaddlePaddle/PP-DocLayoutV3_safetensors \
 //!     document.jpg
 //!
-//! # Using PaddleOCR-VL-1.5 model (next-gen, more accurate)
+//! # Using PaddleOCR-VL-1.5 model
 //! cargo run -p oar-ocr-vl --example doc_parser -- \
 //!     --model-name paddleocr-vl-1.5 \
-//!     --model-dir PaddleOCR-VL-1.5 \
-//!     --layout-model models/pp-doclayoutv3.onnx \
+//!     --model-dir PaddlePaddle/PaddleOCR-VL-1.5 \
+//!     --layout-dir PaddlePaddle/PP-DocLayoutV3_safetensors \
+//!     document.jpg
+//!
+//! # Using PaddleOCR-VL-1.6 model
+//! cargo run -p oar-ocr-vl --example doc_parser -- \
+//!     --model-name paddleocr-vl-1.6 \
+//!     --model-dir PaddlePaddle/PaddleOCR-VL-1.6 \
+//!     --layout-dir PaddlePaddle/PP-DocLayoutV3_safetensors \
 //!     document.jpg
 //!
 //! # Using GLM-OCR model
 //! cargo run -p oar-ocr-vl --example doc_parser -- \
 //!     --model-name glmocr \
-//!     --model-dir models/GLM-OCR \
-//!     --layout-model models/pp-doclayoutv3.onnx \
+//!     --model-dir zai-org/GLM-OCR \
+//!     --layout-dir PaddlePaddle/PP-DocLayoutV3_safetensors \
+//!     document.jpg
+//!
+//! # Using NaviDC-OCR model
+//! cargo run -p oar-ocr-vl --example doc_parser -- \
+//!     --model-name navidc \
+//!     --model-dir StarDoc-AI/NaviDC-OCR \
+//!     --layout-dir PaddlePaddle/PP-DocLayoutV3_safetensors \
 //!     document.jpg
 //! ```
 
@@ -40,11 +54,9 @@ use std::time::Instant;
 
 use tracing::{error, info};
 
-use oar_ocr_core::domain::LayoutDetectionConfig;
-use oar_ocr_core::predictors::LayoutDetectionPredictor;
-use oar_ocr_core::utils::load_image;
+use oar_ocr_vl::utils::image::load_image;
 use oar_ocr_vl::utils::parse_device;
-use oar_ocr_vl::{DocParser, DocParserConfig};
+use oar_ocr_vl::{DocParser, DocParserConfig, PpDocLayout};
 
 /// Recognition model type
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -52,22 +64,25 @@ enum ModelName {
     /// PaddleOCR-VL 0.9B: VLM with task prompts
     #[value(name = "paddleocr-vl")]
     PaddleOcrVl,
-    /// PaddleOCR-VL 1.5: Next-gen VLM with spotting and seal recognition
+    /// PaddleOCR-VL 1.5 (0.9B): spotting and seal recognition
     #[value(name = "paddleocr-vl-1.5")]
     PaddleOcrVl15,
-    /// PaddleOCR-VL 1.6: Latest VLM with enhanced recognition
+    /// PaddleOCR-VL 1.6 (0.9B): region-aware enhanced recognition
     #[value(name = "paddleocr-vl-1.6")]
     PaddleOcrVl16,
     /// GLM-OCR: OCR expert VLM (GLM-V)
     #[value(name = "glmocr")]
     GlmOcr,
+    /// NaviDC-OCR: document parsing VLM (Qwen2.5-VL backbone)
+    #[value(name = "navidc")]
+    NaviDc,
 }
 
 /// Command-line arguments
 #[derive(Parser)]
 #[command(name = "doc_parser")]
 #[command(
-    about = "Unified external-layout DocParser - supports PaddleOCR-VL, PaddleOCR-VL-1.5, and GLM-OCR"
+    about = "Unified external-layout DocParser - supports PaddleOCR-VL, PaddleOCR-VL-1.5/1.6, GLM-OCR, and NaviDC-OCR"
 )]
 struct Args {
     /// Recognition model to use
@@ -78,17 +93,13 @@ struct Args {
     #[arg(short, long)]
     model_dir: PathBuf,
 
-    /// Path to the PP-DocLayout ONNX model file (v2/v3, required)
+    /// Path to a PP-DocLayoutV2/V3 checkpoint directory
     #[arg(short, long)]
-    layout_model: Option<PathBuf>,
+    layout_dir: PathBuf,
 
     /// Paths to input document images
     #[arg(required = true)]
     images: Vec<PathBuf>,
-
-    /// Layout model name for label mapping
-    #[arg(long, default_value = "pp-doclayoutv3")]
-    layout_model_name: String,
 
     /// Device to run on: cpu, cuda, cuda:N, or metal
     #[arg(short, long, default_value = "cpu")]
@@ -102,13 +113,19 @@ struct Args {
     #[arg(long, default_value = "4096")]
     max_tokens: usize,
 
+    /// Maximum same-task crops per region batch. Increase cautiously;
+    /// VLM batches trade more memory for throughput; equal-token batches also
+    /// enable Metal's fused decode path.
+    #[arg(long, default_value = "1")]
+    region_batch_size: usize,
+
     /// Enable verbose output
     #[arg(short, long)]
     verbose: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use oar_ocr_vl::{GlmOcr, PaddleOcrVl};
+    use oar_ocr_vl::{GlmOcr, NaviDcOcr, PaddleOcrVl};
 
     utils::init_tracing();
     let args = Args::parse();
@@ -121,16 +138,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         error!("Model directory not found: {}", args.model_dir.display());
         return Err("Model directory not found".into());
     }
-    let layout_model_path = args.layout_model.as_ref().ok_or_else(|| {
+    if !args.layout_dir.exists() {
         error!(
-            "Layout model is required for {:?}. Use the hunyuanocr/mineru examples for model-native full-page parsing.",
-            args.model_name
+            "Layout checkpoint not found: {}. Use the hunyuanocr/mineru examples for \
+             model-native full-page parsing.",
+            args.layout_dir.display()
         );
-        "Layout model not provided"
-    })?;
-    if !layout_model_path.exists() {
-        error!("Layout model not found: {}", layout_model_path.display());
-        return Err("Layout model not found".into());
+        return Err("Layout checkpoint not found".into());
     }
 
     // Filter valid images
@@ -149,27 +163,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = parse_device(&args.device)?;
     info!("Device: {:?}", device);
 
-    info!("Loading layout model...");
-    let normalized_layout_name = args.layout_model_name.to_lowercase().replace('-', "_");
-    let layout_config = match normalized_layout_name.as_str() {
-        "pp_doclayoutv2" | "pp_doclayout_v2" => {
-            Some(LayoutDetectionConfig::with_pp_doclayoutv2_defaults())
-        }
-        "pp_doclayoutv3" | "pp_doclayout_v3" => {
-            Some(LayoutDetectionConfig::with_pp_doclayoutv3_defaults())
-        }
-        "pp_structurev3" | "pp_structure_v3" => {
-            Some(LayoutDetectionConfig::with_pp_structurev3_defaults())
-        }
-        _ => None,
-    };
-
-    let mut layout_builder =
-        LayoutDetectionPredictor::builder().model_name(&args.layout_model_name);
-    if let Some(config) = layout_config {
-        layout_builder = layout_builder.with_config(config);
-    }
-    let layout_predictor = layout_builder.build(layout_model_path)?;
+    info!("Loading PP-DocLayout...");
+    let layout = PpDocLayout::from_dir(&args.layout_dir, device.clone())?;
+    info!("Layout model: {:?}", layout.version());
 
     // Create config
     let config = DocParserConfig {
@@ -188,8 +184,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 load_start.elapsed().as_secs_f64() * 1000.0
             );
 
-            let parser = DocParser::with_config(&vl, config);
-            process_images(&parser, &layout_predictor, &existing_images, &args)?;
+            let parser =
+                DocParser::with_config(&vl, config).with_region_batch_size(args.region_batch_size);
+            process_images(&parser, &layout, &existing_images, &args)?;
         }
         ModelName::GlmOcr => {
             info!("Loading GLM-OCR model...");
@@ -200,8 +197,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 load_start.elapsed().as_secs_f64() * 1000.0
             );
 
-            let parser = DocParser::with_config(&model, config);
-            process_images(&parser, &layout_predictor, &existing_images, &args)?;
+            let parser = DocParser::with_config(&model, config)
+                .with_region_batch_size(args.region_batch_size);
+            process_images(&parser, &layout, &existing_images, &args)?;
+        }
+        ModelName::NaviDc => {
+            info!("Loading NaviDC-OCR model...");
+            let load_start = Instant::now();
+            let model = NaviDcOcr::from_dir(&args.model_dir, device)?;
+            info!(
+                "NaviDC-OCR loaded in {:.2}ms",
+                load_start.elapsed().as_secs_f64() * 1000.0
+            );
+
+            let parser = DocParser::with_config(&model, config)
+                .with_region_batch_size(args.region_batch_size);
+            process_images(&parser, &layout, &existing_images, &args)?;
         }
     }
     Ok(())
@@ -209,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn process_images<B: oar_ocr_vl::RecognitionBackend>(
     parser: &DocParser<B>,
-    layout_predictor: &LayoutDetectionPredictor,
+    layout: &PpDocLayout,
     images: &[PathBuf],
     args: &Args,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -233,18 +244,15 @@ fn process_images<B: oar_ocr_vl::RecognitionBackend>(
         };
 
         let start = Instant::now();
-        let result = parser.parse(layout_predictor, rgb_img);
+        let result = parser.parse(layout, rgb_img);
         match result {
             Ok(result) => {
                 info!("  Parsed in {:.2}s", start.elapsed().as_secs_f64());
                 info!("  Elements: {}", result.layout_elements.len());
 
-                // Get markdown (OpenOCR-compatible) from the parsed result.
-                let markdown = oar_ocr_vl::utils::to_markdown_openocr(
-                    &result.layout_elements,
-                    ignore_labels,
-                    true,
-                );
+                // Get markdown from the parsed result.
+                let markdown =
+                    oar_ocr_vl::utils::to_markdown(&result.layout_elements, ignore_labels, true);
 
                 // Save or print
                 if let Some(ref dir) = args.output_dir {

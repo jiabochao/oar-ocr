@@ -1458,7 +1458,7 @@ fn dehyphenate(text: &str) -> String {
             }
 
             // Only dehyphenate when hyphen is followed by newline (line-break hyphenation).
-            // Pattern: "word-\nletter" → "wordletter"
+            // Pattern: "word-\nletter" becomes "wordletter".
             let is_artifact = if i + 1 < len && chars[i + 1] == '\n' {
                 // Hyphen followed by newline — check if next line starts with lowercase
                 if i + 2 < len {
@@ -2523,6 +2523,38 @@ pub enum TableType {
     Wireless,
     /// Unknown table type
     Unknown,
+}
+
+impl TableType {
+    /// Stable configuration spelling for this table type.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wired => "wired",
+            Self::Wireless => "wireless",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl AsRef<str> for TableType {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::str::FromStr for TableType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "wired" => Ok(Self::Wired),
+            "wireless" => Ok(Self::Wireless),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(format!(
+                "unknown table type {value:?}; expected 'wired' or 'wireless'"
+            )),
+        }
+    }
 }
 
 /// A cell in a table.

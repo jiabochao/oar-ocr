@@ -12,7 +12,7 @@
 //!
 //! ```bash
 //! cargo run -p oar-ocr-vl --example glmocr -- \
-//!     --model-dir models/GLM-OCR \
+//!     --model-dir zai-org/GLM-OCR \
 //!     --prompt "Text Recognition:" \
 //!     document.jpg
 //! ```
@@ -24,9 +24,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{error, info};
 
-use oar_ocr_core::utils::load_image;
 use oar_ocr_vl::GlmOcr;
+use oar_ocr_vl::utils::image::load_image;
 use oar_ocr_vl::utils::parse_device;
+use utils::token_fingerprint;
 
 #[derive(Parser)]
 #[command(name = "glmocr")]
@@ -101,20 +102,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let infer_start = Instant::now();
-        match model
-            .generate(&[rgb_img], &[args.prompt.as_str()], args.max_tokens)
-            .into_iter()
-            .next()
-        {
-            Some(Ok(result)) => {
+        match model.generate_tokens(&[rgb_img], &[args.prompt.as_str()], args.max_tokens) {
+            Ok(mut results) if !results.is_empty() => {
+                let tokens = results.remove(0);
                 info!(
-                    "  Inference time: {:.2}ms",
-                    infer_start.elapsed().as_secs_f64() * 1000.0
+                    "  Inference time: {:.2}ms, tokens: {}, fingerprint: {:016x}",
+                    infer_start.elapsed().as_secs_f64() * 1000.0,
+                    tokens.len(),
+                    token_fingerprint(&tokens)
                 );
-                println!("{}", result);
+                println!("{}", model.decode_tokens(&tokens)?);
             }
-            Some(Err(e)) => error!("  Inference failed: {}", e),
-            None => error!("  No result returned from model"),
+            Ok(_) => error!("  No result returned from model"),
+            Err(e) => error!("  Inference failed: {}", e),
         }
     }
 

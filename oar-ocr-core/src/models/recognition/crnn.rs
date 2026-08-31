@@ -5,7 +5,7 @@
 
 use crate::core::OCRError;
 use crate::core::inference::{OrtInfer, TensorInput};
-use crate::processors::{CTCLabelDecode, OCRResize};
+use crate::processors::{CTCArgmaxOutput, CTCLabelDecode, OCRResize};
 use image::RgbImage;
 use rayon::prelude::*;
 
@@ -59,6 +59,16 @@ impl CRNNModel {
     ///
     /// A 4D tensor ready for inference
     pub fn preprocess(&self, images: Vec<RgbImage>) -> Result<ndarray::Array4<f32>, OCRError> {
+        let image_refs: Vec<&RgbImage> = images.iter().collect();
+        self.preprocess_refs(&image_refs)
+    }
+
+    /// Preprocesses borrowed images for recognition without cloning their pixel buffers.
+    ///
+    /// This is used by task adapters whose inputs are shared through `Arc<RgbImage>`.
+    /// The resized tensor owns all data needed by inference, so retaining ownership of
+    /// the source images during preprocessing is unnecessary.
+    pub fn preprocess_refs(&self, images: &[&RgbImage]) -> Result<ndarray::Array4<f32>, OCRError> {
         if images.is_empty() {
             return Ok(ndarray::Array4::zeros((0, 0, 0, 0)));
         }
@@ -80,20 +90,24 @@ impl CRNNModel {
         let plane = img_h * tensor_width;
         let image_len = 3 * plane;
 
-        let per_image: Vec<Vec<f32>> = images
-            .par_iter()
-            .map(|img| {
+        // Allocate the final contiguous tensor once and let each worker write
+        // directly into its non-overlapping batch slice. The previous
+        // `Vec<Vec<f32>>` staging allocated once per crop and then copied every
+        // normalized float into a second buffer before inference.
+        let mut data = vec![0.0f32; batch_size * image_len];
+        data.par_chunks_mut(image_len)
+            .zip(images.par_iter())
+            .for_each(|(tensor, img)| {
                 let (orig_w, orig_h) = (img.width() as f32, img.height() as f32);
                 let ratio = orig_w / orig_h;
                 let resized_w = ((img_h as f32 * ratio).ceil() as usize).min(tensor_width);
                 let resized = image::imageops::resize(
-                    img,
+                    *img,
                     resized_w as u32,
                     img_h as u32,
                     image::imageops::FilterType::Triangle,
                 );
 
-                let mut tensor = vec![0.0f32; image_len];
                 // Normalize `(v / 255 - 0.5) / 0.5` in BGR order into the padded
                 // CHW tensor via the SIMD kernel, reading the resized crop's raw
                 // interleaved bytes (no per-pixel `get_pixel`).
@@ -102,16 +116,9 @@ impl CRNNModel {
                     resized_w,
                     img_h,
                     tensor_width,
-                    &mut tensor,
+                    tensor,
                 );
-                tensor
-            })
-            .collect();
-
-        let mut data = Vec::with_capacity(batch_size * image_len);
-        for tensor in per_image {
-            data.extend(tensor);
-        }
+            });
 
         ndarray::Array4::from_shape_vec((batch_size, 3, img_h, tensor_width), data)
             .map_err(|e| OCRError::tensor_operation("Failed to create CRNN input tensor", e))
@@ -180,10 +187,23 @@ impl CRNNModel {
     where
         S: ndarray::Data<Elem = f32> + Sync,
     {
+        let argmax = self.decoder.argmax_predictions(predictions);
+        self.postprocess_argmax(&argmax, return_positions)
+    }
+
+    /// Finishes CTC decoding from compact per-timestep argmax results.
+    ///
+    /// This phase does not need the logits buffer and can run after the ONNX
+    /// Runtime session lock has been released.
+    fn postprocess_argmax(
+        &self,
+        argmax: &CTCArgmaxOutput,
+        return_positions: bool,
+    ) -> CRNNModelOutput {
         if return_positions {
             // Decode CTC predictions with character positions and column indices
             let (texts, scores, char_positions, char_col_indices, sequence_lengths) =
-                self.decoder.apply_with_positions(predictions);
+                self.decoder.decode_argmax_with_positions(argmax);
             CRNNModelOutput {
                 texts,
                 scores,
@@ -193,7 +213,7 @@ impl CRNNModel {
             }
         } else {
             // Decode CTC predictions without positions
-            let (texts, scores) = self.decoder.apply(predictions);
+            let (texts, scores) = self.decoder.decode_argmax(argmax);
             CRNNModelOutput {
                 texts,
                 scores,
@@ -219,6 +239,16 @@ impl CRNNModel {
         images: Vec<RgbImage>,
         return_positions: bool,
     ) -> Result<CRNNModelOutput, OCRError> {
+        let image_refs: Vec<&RgbImage> = images.iter().collect();
+        self.forward_refs(&image_refs, return_positions)
+    }
+
+    /// Runs recognition from borrowed images without copying their pixel buffers.
+    pub fn forward_refs(
+        &self,
+        images: &[&RgbImage],
+        return_positions: bool,
+    ) -> Result<CRNNModelOutput, OCRError> {
         tracing::debug!("CRNN forward: {} images", images.len());
         if !images.is_empty() {
             tracing::debug!(
@@ -227,13 +257,14 @@ impl CRNNModel {
                 images[0].height()
             );
         }
-        let batch_tensor = self.preprocess(images)?;
+        let batch_tensor = self.preprocess_refs(images)?;
         tracing::debug!("CRNN preprocess output shape: {:?}", batch_tensor.shape());
 
-        // Decode straight from ONNX Runtime's output buffer. Building an owned
+        // Reduce straight from ONNX Runtime's output buffer. Building an owned
         // `Array3` here would force a multi-hundred-MB (often multi-GB) copy of
-        // the `(batch, time, vocab)` logits per call; instead we wrap the
-        // borrowed slice in a zero-copy `ArrayView3` and run CTC decode on it.
+        // the `(batch, time, vocab)` logits per call. Only argmax must run while
+        // that borrowed buffer (and therefore the session lock) is alive; CTC
+        // collapse and string construction happen after this call returns.
         let input_name = self.inference.input_name();
         let inputs = vec![(input_name, TensorInput::Array4(&batch_tensor))];
         let output = self
@@ -250,8 +281,9 @@ impl CRNNModel {
                     .map_err(|e| OCRError::InvalidInput {
                         message: format!("CRNN: failed to view output as 3D array: {e}"),
                     })?;
-                Ok(self.postprocess(&view, return_positions))
+                Ok(self.decoder.argmax_predictions(&view))
             })?;
+        let output = self.postprocess_argmax(&output, return_positions);
         tracing::debug!(
             "CRNN postprocess: {} texts, first 3: {:?}",
             output.texts.len(),

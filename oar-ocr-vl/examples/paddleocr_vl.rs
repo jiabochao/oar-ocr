@@ -1,7 +1,9 @@
 //! PaddleOCR-VL Recognition Example (Candle-based)
 //!
-//! This example demonstrates how to use PaddleOCR-VL for task-specific recognition
-//! of text, formulas, tables, and charts using the Candle ML framework.
+//! This example runs PaddleOCR-VL, PaddleOCR-VL-1.5, or PaddleOCR-VL-1.6 for
+//! task-specific recognition using the Candle ML framework. All variants
+//! support text, formula, table, and chart recognition. Versions 1.5 and 1.6
+//! also support text spotting and seal recognition.
 //!
 //! # Usage
 //!
@@ -20,33 +22,33 @@
 //! # Examples
 //!
 //! ```bash
-//! # OCR (text recognition)
+//! # OCR text recognition
 //! cargo run -p oar-ocr-vl --example paddleocr_vl -- \
-//!     -m PaddleOCR-VL --task ocr document.jpg
+//!     -m PaddlePaddle/PaddleOCR-VL --task ocr document.jpg
 //!
 //! # Table recognition
 //! cargo run -p oar-ocr-vl --example paddleocr_vl -- \
-//!     -m PaddleOCR-VL --task table table.jpg
+//!     -m PaddlePaddle/PaddleOCR-VL --task table table.jpg
 //!
 //! # Formula recognition
 //! cargo run -p oar-ocr-vl --example paddleocr_vl -- \
-//!     -m PaddleOCR-VL --task formula formula.jpg
+//!     -m PaddlePaddle/PaddleOCR-VL --task formula formula.jpg
 //!
 //! # Chart recognition
 //! cargo run -p oar-ocr-vl --example paddleocr_vl -- \
-//!     -m PaddleOCR-VL --task chart chart.jpg
+//!     -m PaddlePaddle/PaddleOCR-VL --task chart chart.jpg
 //!
-//! # Text spotting (PaddleOCR-VL-1.5)
+//! # Text spotting with PaddleOCR-VL-1.5 or 1.6
 //! cargo run -p oar-ocr-vl --example paddleocr_vl -- \
-//!     -m PaddleOCR-VL-1.5 --task spotting spotting.jpg
+//!     -m PaddlePaddle/PaddleOCR-VL-1.5 --task spotting spotting.jpg
 //!
-//! # Seal recognition (PaddleOCR-VL-1.5)
+//! # Seal recognition with PaddleOCR-VL-1.5 or 1.6
 //! cargo run -p oar-ocr-vl --example paddleocr_vl -- \
-//!     -m PaddleOCR-VL-1.5 --task seal seal.jpg
+//!     -m PaddlePaddle/PaddleOCR-VL-1.6 --task seal seal.jpg
 //!
 //! # Run on CUDA GPU
 //! cargo run -p oar-ocr-vl --features cuda --example paddleocr_vl -- \
-//!     -m PaddleOCR-VL -d cuda --task ocr document.jpg
+//!     -m PaddlePaddle/PaddleOCR-VL -d cuda --task ocr document.jpg
 //! ```
 
 mod utils;
@@ -57,9 +59,10 @@ use std::time::Instant;
 
 use tracing::{error, info};
 
-use oar_ocr_core::utils::load_image;
+use oar_ocr_vl::utils::image::load_image;
 use oar_ocr_vl::utils::parse_device;
 use oar_ocr_vl::{PaddleOcrVl, PaddleOcrVlTask};
+use utils::token_fingerprint;
 
 /// Command-line arguments for the PaddleOCR-VL example
 #[derive(Parser)]
@@ -67,7 +70,7 @@ use oar_ocr_vl::{PaddleOcrVl, PaddleOcrVlTask};
 #[command(about = "PaddleOCR-VL Recognition Example - task-specific recognition using Candle")]
 struct Args {
     /// Path to the PaddleOCR-VL model directory
-    #[arg(short, long, default_value = "PaddleOCR-VL")]
+    #[arg(short, long, default_value = "PaddlePaddle/PaddleOCR-VL")]
     model_dir: PathBuf,
 
     /// Paths to input images to process
@@ -85,6 +88,10 @@ struct Args {
     /// Maximum number of tokens to generate (default: 512)
     #[arg(long, default_value = "512")]
     max_tokens: usize,
+
+    /// Repeat inference to expose Metal warm-up and steady-state latency.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    repeat: u32,
 }
 
 fn parse_task(task_str: &str) -> Result<PaddleOcrVlTask, Box<dyn std::error::Error>> {
@@ -161,34 +168,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for image_path in &existing_images {
         info!("\nProcessing: {}", image_path.display());
-
-        // Load image
         let rgb_img = match load_image(image_path) {
-            Ok(img) => img,
+            Ok(image) => image,
             Err(e) => {
                 error!("  Failed to load image: {}", e);
                 continue;
             }
         };
 
-        // Run inference
-        let infer_start = Instant::now();
-        match model
-            .generate(&[rgb_img], &[task], args.max_tokens)
-            .pop()
-            .unwrap()
-        {
-            Ok(result) => {
-                let infer_duration = infer_start.elapsed();
-                info!(
-                    "  Inference time: {:.2}ms",
-                    infer_duration.as_secs_f64() * 1000.0
-                );
-                println!("{}", result);
-            }
-            Err(e) => {
-                error!("  Inference failed: {}", e);
-            }
+        let mut last_tokens = None;
+        for iteration in 1..=args.repeat {
+            let infer_start = Instant::now();
+            let result = model
+                .generate_tokens(std::slice::from_ref(&rgb_img), &[task], args.max_tokens)?
+                .pop()
+                .ok_or("single-image request returned no result")?;
+            let infer_duration = infer_start.elapsed();
+            info!(
+                "  Inference time (run {}/{}): {:.2}ms, tokens: {}, {:.2} tokens/s, fingerprint: {:016x}",
+                iteration,
+                args.repeat,
+                infer_duration.as_secs_f64() * 1000.0,
+                result.len(),
+                result.len() as f64 / infer_duration.as_secs_f64(),
+                token_fingerprint(&result)
+            );
+            last_tokens = Some(result);
+        }
+        if let Some(tokens) = last_tokens {
+            println!("{}", model.decode_tokens(&tokens, task)?.1);
         }
     }
     Ok(())
