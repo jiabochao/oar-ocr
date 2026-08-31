@@ -98,6 +98,37 @@ fn semantic_title_level(text: &str) -> Option<usize> {
     semantic_title_level_and_format(&cleaned).map(|(level, _)| level)
 }
 
+/// A heading as `to_markdown` renders it.
+///
+/// Consumers that build their own output from a [`StructureResult`] — a DOCX
+/// writer, a bookmark/outline pane — need the same heading depth the Markdown
+/// shows. Parsing the rendered Markdown back, or re-deriving levels from the
+/// numbering alone, drifts from it; see [`StructureResult::headings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heading {
+    /// Index of the title element in `layout_elements`.
+    pub element_index: usize,
+    /// Heading depth, 1-6. The same length as the `#` run in the Markdown.
+    pub level: usize,
+    /// Title text, cleaned and (for numbered titles) with the numbering
+    /// normalised — exactly what the Markdown heading line carries.
+    pub text: String,
+}
+
+/// Heading level of a document title: 1, or 2 for section keywords that the
+/// layout model tends to over-promote.
+fn doc_title_level(cleaned: &str) -> usize {
+    let keyword = cleaned.trim().trim_end_matches(':').to_ascii_uppercase();
+    if matches!(
+        keyword.as_str(),
+        "ABSTRACT" | "INTRODUCTION" | "REFERENCES" | "REFERENCE"
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
 fn format_title_with_level(title: &str, clustered_level: Option<usize>) -> (usize, String) {
     // Clean up line breaks
     let cleaned = title.replace("-\n", "").replace('\n', " ");
@@ -457,6 +488,37 @@ impl StructureResult {
         self
     }
 
+    /// Heading level and text for every title element, in reading order.
+    ///
+    /// These are the levels [`Self::to_markdown`] writes as `#` runs: document
+    /// titles are level 1 (section keywords such as `ABSTRACT` are demoted to
+    /// 2), paragraph titles come from the numbering/indent/font-size vote in
+    /// `infer_paragraph_title_levels`. Title elements without text are left
+    /// out. Use [`Heading::element_index`] to get back to the element and its
+    /// bounding box.
+    pub fn headings(&self) -> Vec<Heading> {
+        let clustered = infer_paragraph_title_levels(&self.layout_elements);
+        self.layout_elements
+            .iter()
+            .enumerate()
+            .filter_map(|(element_index, element)| {
+                let cleaned = clean_ocr_text(element.text.as_deref()?);
+                let (level, text) = match element.element_type {
+                    LayoutElementType::DocTitle => (doc_title_level(&cleaned), cleaned),
+                    LayoutElementType::ParagraphTitle => {
+                        format_title_with_level(&cleaned, clustered.get(&element_index).copied())
+                    }
+                    _ => return None,
+                };
+                Some(Heading {
+                    element_index,
+                    level,
+                    text,
+                })
+            })
+            .collect()
+    }
+
     /// Converts the result to a Markdown string.
     ///
     /// Follows PP-StructureV3's formatting rules:
@@ -493,7 +555,13 @@ impl StructureResult {
 
         let mut md = String::new();
         let elements = &self.layout_elements;
-        let paragraph_title_levels = infer_paragraph_title_levels(elements);
+        // Titles are levelled once, here, so that `headings()` and the Markdown
+        // can never disagree about how deep a heading is.
+        let headings: HashMap<usize, Heading> = self
+            .headings()
+            .into_iter()
+            .map(|heading| (heading.element_index, heading))
+            .collect();
         // Track the most recent Text/ReferenceContent element so paragraph
         // continuation works across intervening figures/tables.
         let mut prev_text_element: Option<&LayoutElement> = None;
@@ -548,19 +616,12 @@ impl StructureResult {
                     if !md.is_empty() {
                         md.push_str("\n\n");
                     }
-                    if let Some(text) = &element.text {
-                        let cleaned = clean_ocr_text(text);
-                        // Downgrade section-level keywords to ## when misclassified as DocTitle
-                        let keyword = cleaned.trim().trim_end_matches(':').to_ascii_uppercase();
-                        if matches!(
-                            keyword.as_str(),
-                            "ABSTRACT" | "INTRODUCTION" | "REFERENCES" | "REFERENCE"
-                        ) {
-                            md.push_str("## ");
-                        } else {
-                            md.push_str("# ");
+                    if let Some(heading) = headings.get(&idx) {
+                        for _ in 0..heading.level {
+                            md.push('#');
                         }
-                        md.push_str(&cleaned);
+                        md.push(' ');
+                        md.push_str(&heading.text);
                     }
                 }
                 // Paragraph/section title - auto-detect numbering for level
@@ -568,17 +629,16 @@ impl StructureResult {
                     if !md.is_empty() {
                         md.push_str("\n\n");
                     }
-                    if let Some(text) = &element.text {
-                        let cleaned = clean_ocr_text(text);
-                        let clustered = paragraph_title_levels.get(&idx).copied();
-                        let (level, formatted_title) = format_title_with_level(&cleaned, clustered);
-                        for _ in 0..level {
-                            md.push('#');
+                    match headings.get(&idx) {
+                        Some(heading) => {
+                            for _ in 0..heading.level {
+                                md.push('#');
+                            }
+                            md.push(' ');
+                            md.push_str(&heading.text);
                         }
-                        md.push(' ');
-                        md.push_str(&formatted_title);
-                    } else {
-                        md.push_str("## ");
+                        // A title element with no text still opens a section.
+                        None => md.push_str("## "),
                     }
                 }
                 // Table - preserve HTML structure with border and center alignment
@@ -2752,6 +2812,44 @@ mod tests {
         result = result.with_layout_elements(vec![toc]);
         let md = result.to_markdown();
         assert!(md.contains("1 Intro  \n2 Method"));
+    }
+
+    #[test]
+    fn test_headings_match_the_markdown_hash_runs() {
+        let mut result = StructureResult::new("test.jpg", 0);
+        let element = |y: f32, height: f32, kind: LayoutElementType, text: &str| {
+            LayoutElement::new(
+                BoundingBox::from_coords(0.0, y, 100.0, y + height),
+                kind,
+                1.0,
+            )
+            .with_text(text)
+        };
+        result = result.with_layout_elements(vec![
+            element(0.0, 40.0, LayoutElementType::DocTitle, "Annual Report"),
+            element(50.0, 24.0, LayoutElementType::ParagraphTitle, "1 Overview"),
+            element(80.0, 18.0, LayoutElementType::ParagraphTitle, "1.1.1 Data"),
+            element(110.0, 18.0, LayoutElementType::Text, "Body text"),
+        ]);
+
+        let headings = result.headings();
+        assert_eq!(
+            headings
+                .iter()
+                .map(|heading| (heading.element_index, heading.level))
+                .collect::<Vec<_>>(),
+            [(0, 1), (1, 2), (2, 4)]
+        );
+
+        // Whatever `headings()` reports has to be what the Markdown writes.
+        let md = result.to_markdown();
+        for heading in &headings {
+            assert!(
+                md.contains(&format!("{} {}", "#".repeat(heading.level), heading.text)),
+                "missing `{}` in:\n{md}",
+                heading.text
+            );
+        }
     }
 
     #[test]
