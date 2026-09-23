@@ -49,6 +49,9 @@ const REGION_MEMBERSHIP_IOA_THRESHOLD: f32 = 0.1;
 const TEXT_BOX_SPLIT_IOA_THRESHOLD: f32 = 0.3;
 
 /// Internal structure holding the structure analysis pipeline adapters.
+/// One recognized overall-OCR line: text, score and optional per-character boxes.
+type RecognizedLine = (String, f32, Option<Vec<crate::processors::BoundingBox>>);
+
 #[derive(Debug)]
 struct StructurePipeline {
     // Document preprocessing (optional)
@@ -174,6 +177,8 @@ pub struct OARStructureBuilder {
     text_line_orientation_model: Option<ModelSource>,
     text_recognition_model: Option<ModelSource>,
     character_dict_path: Option<PathBuf>,
+    // Emit per-character boxes (`TextRegion::word_boxes`) for overall OCR lines.
+    return_word_box: bool,
 
     // Model name presets for loading correct pre/post processors
     region_model_name: Option<String>,
@@ -298,6 +303,7 @@ impl OARStructureBuilder {
             text_line_orientation_model: None,
             text_recognition_model: None,
             character_dict_path: None,
+            return_word_box: false,
             region_model_name: None,
             wired_table_structure_model_name: None,
             wireless_table_structure_model_name: None,
@@ -786,6 +792,17 @@ impl OARStructureBuilder {
     /// - This improves accuracy for documents scanned upside-down or with mixed orientations
     pub fn with_text_line_orientation(mut self, model_source: impl Into<ModelSource>) -> Self {
         self.text_line_orientation_model = Some(model_source.into());
+        self
+    }
+
+    /// Populates `TextRegion::word_boxes` with one box per recognized character.
+    ///
+    /// Boxes are derived from the CTC column each character was decoded at, the same
+    /// way `OAROCRBuilder::return_word_box` does it. Only the page-level OCR lines get
+    /// them; regions re-recognized later (cross-layout splits, table-cell splits,
+    /// layout fallbacks) have no column information and keep `None`.
+    pub fn return_word_box(mut self, enable: bool) -> Self {
+        self.return_word_box = enable;
         self
     }
 
@@ -1435,7 +1452,9 @@ impl OARStructureBuilder {
             // Parse dict into Vec<String> - one character per line
             let char_vec: Vec<String> = dict.lines().map(|s| s.to_string()).collect();
 
-            let mut builder = TextRecognitionAdapterBuilder::new().character_dict(char_vec);
+            let mut builder = TextRecognitionAdapterBuilder::new()
+                .character_dict(char_vec)
+                .return_word_box(self.return_word_box);
 
             if let Some(ref config) = self.text_recognition_config {
                 builder = builder.with_config(config.clone());
@@ -1700,6 +1719,8 @@ impl OARStructure {
                     text_regions[ocr_idx].rec_poly = Some(crop_box.clone());
                     text_regions[ocr_idx].text = Some(Arc::from(text));
                     text_regions[ocr_idx].confidence = Some(score);
+                    // Re-recognized from a narrower crop: the old boxes no longer apply.
+                    text_regions[ocr_idx].word_boxes = None;
                 } else {
                     appended_regions.push(crate::oarocr::TextRegion {
                         bounding_box: crop_box.clone(),
@@ -2338,6 +2359,64 @@ impl OARStructure {
         }
     }
 
+    /// Per-character boxes for one overall-OCR line, or `None` when the recognizer
+    /// did not report CTC columns (word boxes disabled) or the line is not laid out
+    /// left-to-right in the crop.
+    ///
+    /// `TextCroppingProcessor` turns tall crops by 90° before recognition, so the
+    /// columns of a vertical line run down the page rather than across it; those are
+    /// skipped instead of producing boxes along the wrong axis.
+    fn overall_ocr_word_boxes(
+        line_box: &crate::processors::BoundingBox,
+        text: &str,
+        col_indices: Option<&[usize]>,
+        seq_len: Option<usize>,
+        wh_ratio: f32,
+        max_wh_ratio: f32,
+        flipped: bool,
+    ) -> Option<Vec<crate::processors::BoundingBox>> {
+        let col_indices = col_indices.filter(|cols| !cols.is_empty())?;
+        let seq_len = seq_len.filter(|len| *len > 0)?;
+        let width = line_box.x_max() - line_box.x_min();
+        let height = line_box.y_max() - line_box.y_min();
+        if width <= 0.0 || height <= 0.0 || height >= width * 1.5 {
+            return None;
+        }
+        if col_indices.len() != text.chars().count() {
+            return None;
+        }
+
+        let boxes = crate::oarocr::OAROCR::ctc_word_boxes(
+            line_box,
+            text,
+            col_indices,
+            seq_len,
+            wh_ratio,
+            max_wh_ratio,
+        );
+        if boxes.len() != col_indices.len() {
+            return None;
+        }
+        if !flipped {
+            return Some(boxes);
+        }
+        // Recognized upside down: mirror each box across the line's vertical center.
+        let (x_min, x_max) = (line_box.x_min(), line_box.x_max());
+        Some(
+            boxes
+                .into_iter()
+                .map(|b| {
+                    crate::processors::BoundingBox::from_coords(
+                        x_min + x_max - b.x_max(),
+                        b.y_min(),
+                        x_min + x_max - b.x_min(),
+                        b.y_max(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     fn run_overall_ocr(
         &self,
         page_image: &image::RgbImage,
@@ -2527,6 +2606,9 @@ impl OARStructure {
             }
 
             if !cropped_images.is_empty() {
+                // Lines turned 180° before recognition: their character columns run
+                // right-to-left on the page.
+                let mut flipped = vec![false; cropped_images.len()];
                 // PaddleX applies textline orientation in detection order first.
                 if let Some(ref tlo_adapter) = self.pipeline.text_line_orientation_adapter {
                     let tlo_input = ImageTaskInput::new(cropped_images.clone());
@@ -2543,6 +2625,7 @@ impl OARStructure {
                                 {
                                     cropped_images[i] =
                                         image::imageops::rotate180(&cropped_images[i]);
+                                    flipped[i] = true;
                                 }
                             }
                         }
@@ -2555,12 +2638,13 @@ impl OARStructure {
                     }
                 }
 
-                let mut items: Vec<(usize, f32, image::RgbImage)> = valid_indices
+                let mut items: Vec<(usize, f32, bool, image::RgbImage)> = valid_indices
                     .into_iter()
                     .zip(cropped_images)
-                    .map(|(det_idx, img)| {
+                    .zip(flipped)
+                    .map(|((det_idx, img), flipped)| {
                         let wh_ratio = img.width() as f32 / img.height().max(1) as f32;
-                        (det_idx, wh_ratio, img)
+                        (det_idx, wh_ratio, flipped, img)
                     })
                     .collect();
 
@@ -2571,7 +2655,10 @@ impl OARStructure {
                     .region_batch_size
                     .unwrap_or_else(|| text_recognition_adapter.recommended_batch_size())
                     .max(1);
-                let mut recognized_by_det_idx: Vec<Option<(String, f32)>> =
+                let base_rec_ratio = oar_ocr_core::core::constants::DEFAULT_REC_IMAGE_SHAPE[2]
+                    as f32
+                    / oar_ocr_core::core::constants::DEFAULT_REC_IMAGE_SHAPE[1] as f32;
+                let mut recognized_by_det_idx: Vec<Option<RecognizedLine>> =
                     vec![None; detection_boxes.len()];
                 let mut rec_batches = 0usize;
                 let t_text_rec = Instant::now();
@@ -2583,27 +2670,44 @@ impl OARStructure {
                         break;
                     }
 
-                    let mut det_indices: Vec<usize> = Vec::with_capacity(batch_items.len());
+                    // The recognizer pads every image in a batch to the widest one, so a
+                    // character's CTC column is relative to that padded width.
+                    let batch_max_wh_ratio = batch_items
+                        .iter()
+                        .map(|item| item.1)
+                        .fold(base_rec_ratio, f32::max);
+
+                    let mut metas: Vec<(usize, f32, bool)> = Vec::with_capacity(batch_items.len());
                     let mut rec_imgs: Vec<image::RgbImage> = Vec::with_capacity(batch_items.len());
-                    for (det_idx, _ratio, img) in batch_items {
-                        det_indices.push(det_idx);
+                    for (det_idx, ratio, flipped, img) in batch_items {
+                        metas.push((det_idx, ratio, flipped));
                         rec_imgs.push(img);
                     }
 
                     let rec_input = ImageTaskInput::new(rec_imgs);
                     rec_batches += 1;
+                    let batch_len = metas.len();
                     match text_recognition_adapter.execute(rec_input, None) {
                         Ok(rec_result) => {
-                            for ((det_idx, text), score) in det_indices
+                            for (i, ((det_idx, ratio, flipped), (text, score))) in metas
                                 .into_iter()
-                                .zip(rec_result.texts)
-                                .zip(rec_result.scores)
+                                .zip(rec_result.texts.into_iter().zip(rec_result.scores))
+                                .enumerate()
                             {
                                 if text.is_empty() {
                                     continue;
                                 }
+                                let word_boxes = Self::overall_ocr_word_boxes(
+                                    &detection_boxes[det_idx],
+                                    &text,
+                                    rec_result.char_col_indices.get(i).map(Vec::as_slice),
+                                    rec_result.sequence_lengths.get(i).copied(),
+                                    ratio,
+                                    batch_max_wh_ratio,
+                                    flipped,
+                                );
                                 if let Some(slot) = recognized_by_det_idx.get_mut(det_idx) {
-                                    *slot = Some((text, score));
+                                    *slot = Some((text, score, word_boxes));
                                 }
                             }
                         }
@@ -2613,7 +2717,7 @@ impl OARStructure {
                         Err(err) => {
                             tracing::warn!(
                                 "Text recognition batch failed for {} crops and will be skipped: {}",
-                                det_indices.len(),
+                                batch_len,
                                 err
                             );
                         }
@@ -2629,7 +2733,7 @@ impl OARStructure {
 
                 // Emit OCR regions in original detection order, matching PaddleX.
                 for (det_idx, rec) in recognized_by_det_idx.into_iter().enumerate() {
-                    let Some((text, score)) = rec else {
+                    let Some((text, score, word_boxes)) = rec else {
                         continue;
                     };
                     let bbox = detection_boxes[det_idx].clone();
@@ -2640,7 +2744,7 @@ impl OARStructure {
                         text: Some(Arc::from(text)),
                         confidence: Some(score),
                         orientation_angle: None,
-                        word_boxes: None,
+                        word_boxes,
                         label: None,
                     });
                 }
@@ -3022,13 +3126,15 @@ impl OARStructure {
         #[derive(Default)]
         struct PageOcrState {
             detection_boxes: Vec<crate::processors::BoundingBox>,
-            recognized: Vec<Option<(String, f32)>>,
+            recognized: Vec<Option<RecognizedLine>>,
         }
 
         struct RecItem {
             page_idx: usize,
             det_idx: usize,
             wh_ratio: f32,
+            // Turned 180° by text-line orientation before recognition.
+            flipped: bool,
             image: Arc<image::RgbImage>,
         }
 
@@ -3246,6 +3352,7 @@ impl OARStructure {
                                 page_idx,
                                 det_idx,
                                 wh_ratio,
+                                flipped: false,
                                 image: img,
                             });
                         }
@@ -3281,6 +3388,7 @@ impl OARStructure {
                                 && top_cls.class_id == 1
                             {
                                 item.image = Arc::new(image::imageops::rotate180(&*item.image));
+                                item.flipped = true;
                             }
                         }
                     }
@@ -3306,6 +3414,8 @@ impl OARStructure {
                 .unwrap_or_else(|| text_recognition_adapter.recommended_batch_size())
                 .max(1);
 
+            let base_rec_ratio = oar_ocr_core::core::constants::DEFAULT_REC_IMAGE_SHAPE[2] as f32
+                / oar_ocr_core::core::constants::DEFAULT_REC_IMAGE_SHAPE[1] as f32;
             let t_recognition = Instant::now();
             let mut start = 0usize;
             while start < rec_items.len() {
@@ -3314,6 +3424,12 @@ impl OARStructure {
                 let rec_input = ImageTaskInput::from_arc_images(
                     chunk.iter().map(|item| Arc::clone(&item.image)).collect(),
                 );
+                // The recognizer pads every image in a batch to the widest one, so a
+                // character's CTC column is relative to that padded width.
+                let batch_max_wh_ratio = chunk
+                    .iter()
+                    .map(|item| item.wh_ratio)
+                    .fold(base_rec_ratio, f32::max);
                 match text_recognition_adapter.execute(rec_input, None) {
                     Ok(rec_result) => {
                         for (i, item) in chunk.iter().enumerate() {
@@ -3325,7 +3441,16 @@ impl OARStructure {
                             if let Some(Some(state)) = page_states.get_mut(item.page_idx)
                                 && let Some(slot) = state.recognized.get_mut(item.det_idx)
                             {
-                                *slot = Some((text, score));
+                                let word_boxes = Self::overall_ocr_word_boxes(
+                                    &state.detection_boxes[item.det_idx],
+                                    &text,
+                                    rec_result.char_col_indices.get(i).map(Vec::as_slice),
+                                    rec_result.sequence_lengths.get(i).copied(),
+                                    item.wh_ratio,
+                                    batch_max_wh_ratio,
+                                    item.flipped,
+                                );
+                                *slot = Some((text, score, word_boxes));
                             }
                         }
                     }
@@ -3361,7 +3486,7 @@ impl OARStructure {
 
             let mut text_regions = Vec::new();
             for (det_idx, rec) in state.recognized.into_iter().enumerate() {
-                let Some((text, score)) = rec else {
+                let Some((text, score, word_boxes)) = rec else {
                     continue;
                 };
                 let bbox = state.detection_boxes[det_idx].clone();
@@ -3372,7 +3497,7 @@ impl OARStructure {
                     text: Some(Arc::from(text)),
                     confidence: Some(score),
                     orientation_angle: None,
-                    word_boxes: None,
+                    word_boxes,
                     label: None,
                 });
             }

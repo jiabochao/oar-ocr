@@ -389,8 +389,7 @@ fn split_horizontally(
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap_or((ocr_x_min, ocr_x_max));
-            let segment_bbox =
-                BoundingBox::from_coords(best_x1, ocr_y_min, best_x2, ocr_y_max);
+            let segment_bbox = BoundingBox::from_coords(best_x1, ocr_y_min, best_x2, ocr_y_max);
             let best_cell = find_best_matching_cell(&segment_bbox, cell_indices, cells);
             return vec![SplitSegment {
                 bbox: segment_bbox,
@@ -483,8 +482,7 @@ fn split_vertically(
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap_or((ocr_y_min, ocr_y_max));
-            let segment_bbox =
-                BoundingBox::from_coords(ocr_x_min, best_y1, ocr_x_max, best_y2);
+            let segment_bbox = BoundingBox::from_coords(ocr_x_min, best_y1, ocr_x_max, best_y2);
             let best_cell = find_best_matching_cell(&segment_bbox, cell_indices, cells);
             return vec![SplitSegment {
                 bbox: segment_bbox,
