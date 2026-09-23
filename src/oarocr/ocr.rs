@@ -835,7 +835,7 @@ impl OAROCR {
     /// # Returns
     ///
     /// A vector of bounding boxes, one for each character
-    fn ctc_word_boxes(
+    pub(crate) fn ctc_word_boxes(
         line_bbox: &BoundingBox,
         text: &str,
         col_indices: &[usize],
