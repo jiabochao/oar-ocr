@@ -2,7 +2,7 @@
 
 use crate::core::OCRError;
 use crate::processors::BoundingBox;
-use crate::utils::transform::get_rotate_crop_image;
+use crate::utils::transform::{get_rotate_crop_image, rotate_if_vertical};
 use image::{RgbImage, imageops};
 
 /// Bounding box based image cropping utilities.
@@ -168,7 +168,8 @@ impl BBoxCrop {
 
         let box_points = bbox.points.clone();
 
-        // Fast path: if the quadrilateral is axis-aligned rectangle, use simple crop
+        // Fast path: if the quadrilateral is axis-aligned rectangle, use simple crop.
+        // It must apply the same vertical-text rotation as `get_rotate_crop_image`.
         if let [p0, p1, p2, p3] = &box_points[..] {
             let is_axis_aligned = (p0.y == p1.y && p2.y == p3.y && p0.x == p3.x && p1.x == p2.x)
                 || (p0.x == p1.x && p2.x == p3.x && p0.y == p3.y && p1.y == p2.y);
@@ -185,7 +186,8 @@ impl BBoxCrop {
                     use image::imageops;
                     let w = max_x - min_x;
                     let h = max_y - min_y;
-                    return Ok(imageops::crop_imm(image, min_x, min_y, w, h).to_image());
+                    let crop = imageops::crop_imm(image, min_x, min_y, w, h).to_image();
+                    return Ok(rotate_if_vertical(crop));
                 }
             }
         }
@@ -400,6 +402,38 @@ mod tests {
         // Sample a couple of pixels to ensure identical content
         assert_eq!(cropped_fast.get_pixel(0, 0), expected.get_pixel(0, 0));
         assert_eq!(cropped_fast.get_pixel(49, 29), expected.get_pixel(49, 29));
+    }
+
+    #[test]
+    fn test_crop_rotated_bounding_box_axis_aligned_vertical_is_rotated() {
+        let img = create_test_image(100, 100);
+        // A tall, axis-aligned box: a vertical text column.
+        let bbox = BoundingBox {
+            points: vec![
+                Point { x: 10.0, y: 10.0 },
+                Point { x: 30.0, y: 10.0 },
+                Point { x: 30.0, y: 90.0 },
+                Point { x: 10.0, y: 90.0 },
+            ],
+        };
+        let cropped = BBoxCrop::crop_rotated_bounding_box(&img, &bbox).unwrap();
+        // Rotated 90° counter-clockwise, same as the perspective-transform path.
+        let expected = imageops::rotate270(&imageops::crop_imm(&img, 10, 10, 20, 80).to_image());
+        assert_eq!(cropped.dimensions(), (80, 20));
+        assert_eq!(cropped, expected);
+
+        // A slightly skewed version of the same column takes the slow path and
+        // must come out with the same orientation.
+        let skewed = BoundingBox {
+            points: vec![
+                Point { x: 10.0, y: 10.0 },
+                Point { x: 30.0, y: 10.5 },
+                Point { x: 30.0, y: 90.0 },
+                Point { x: 10.0, y: 90.0 },
+            ],
+        };
+        let slow = BBoxCrop::crop_rotated_bounding_box(&img, &skewed).unwrap();
+        assert!(slow.width() > slow.height());
     }
 
     #[test]

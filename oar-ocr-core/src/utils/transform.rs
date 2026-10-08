@@ -151,17 +151,25 @@ pub fn get_rotate_crop_image(
         img_crop_height,
     )?;
 
-    // Automatically rotate if the aspect ratio suggests the text is vertical
-    if dst_img.height() as f32 >= dst_img.width() as f32 * 1.5 {
+    Ok(rotate_if_vertical(dst_img))
+}
+
+/// Rotates a text-line crop 90° counter-clockwise when its aspect ratio suggests
+/// vertical text (height >= 1.5 × width), so the recognizer reads it left to right.
+///
+/// Every crop handed to text recognition must go through this, whichever way it
+/// was cut: an axis-aligned fast path that skips it feeds the recognizer a tall,
+/// unrotated column, which it squeezes into a single garbled character.
+pub fn rotate_if_vertical(img: RgbImage) -> RgbImage {
+    if img.height() as f32 >= img.width() as f32 * 1.5 {
         debug!(
             "Rotating image due to aspect ratio: {}x{}",
-            dst_img.width(),
-            dst_img.height()
+            img.width(),
+            img.height()
         );
-
-        Ok(imageops::rotate270(&dst_img))
+        imageops::rotate270(&img)
     } else {
-        Ok(dst_img)
+        img
     }
 }
 
