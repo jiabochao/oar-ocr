@@ -64,16 +64,8 @@ struct StructurePipeline {
     // Region detection for hierarchical ordering (optional, PP-DocBlockLayout)
     region_detection_adapter: Option<LayoutDetectionAdapter>,
 
-    // Table analysis (optional)
-    table_classification_adapter: Option<TableClassificationAdapter>,
-    table_orientation_adapter: Option<DocumentOrientationAdapter>, // Reuses doc orientation model
-    table_cell_detection_adapter: Option<TableCellDetectionAdapter>,
-    table_structure_recognition_adapter: Option<TableStructureRecognitionAdapter>,
-    // PP-StructureV3 auto-switch: separate adapters for wired/wireless tables
-    wired_table_structure_adapter: Option<TableStructureRecognitionAdapter>,
-    wireless_table_structure_adapter: Option<TableStructureRecognitionAdapter>,
-    wired_table_cell_adapter: Option<TableCellDetectionAdapter>,
-    wireless_table_cell_adapter: Option<TableCellDetectionAdapter>,
+    // Table analysis (optional), loaded at build time or on the first table.
+    tables: TableModelSlot,
     // E2E mode: when true, skip cell detection and use only structure model output
     use_e2e_wired_table_rec: bool,
     use_e2e_wireless_table_rec: bool,
@@ -93,6 +85,61 @@ struct StructurePipeline {
     // Batch sizes for image-level and region-level processing.
     image_batch_size: Option<usize>,
     region_batch_size: Option<usize>,
+}
+
+/// Table-analysis adapters. They are built together so that they can be loaded
+/// on demand (see [`OARStructureBuilder::lazy_table_models`]).
+#[derive(Debug, Default)]
+struct TableModels {
+    table_classification_adapter: Option<TableClassificationAdapter>,
+    table_orientation_adapter: Option<DocumentOrientationAdapter>, // Reuses doc orientation model
+    table_cell_detection_adapter: Option<TableCellDetectionAdapter>,
+    table_structure_recognition_adapter: Option<TableStructureRecognitionAdapter>,
+    // PP-StructureV3 auto-switch: separate adapters for wired/wireless tables
+    wired_table_structure_adapter: Option<TableStructureRecognitionAdapter>,
+    wireless_table_structure_adapter: Option<TableStructureRecognitionAdapter>,
+    wired_table_cell_adapter: Option<TableCellDetectionAdapter>,
+    wireless_table_cell_adapter: Option<TableCellDetectionAdapter>,
+}
+
+/// Where the pipeline keeps its table adapters.
+#[derive(Debug)]
+enum TableModelSlot {
+    /// Built with the rest of the pipeline.
+    Eager(Arc<TableModels>),
+    /// Built from `spec` when a page first contains a table, and dropped again
+    /// by [`OARStructure::release_table_models`]. Pages without tables never
+    /// pay for these sessions.
+    Lazy {
+        spec: Box<TableModelSpec>,
+        loaded: std::sync::Mutex<Option<Arc<TableModels>>>,
+    },
+}
+
+/// The builder settings needed to construct [`TableModels`], kept apart from
+/// the builder so a lazily loaded pipeline does not hold on to other models
+/// (in-memory sources in particular).
+#[derive(Debug, Clone)]
+struct TableModelSpec {
+    ort_session_config: Option<OrtSessionConfig>,
+    table_classification_model: Option<ModelSource>,
+    table_classification_config: Option<TableClassificationConfig>,
+    table_orientation_model: Option<ModelSource>,
+    table_cell_detection_model: Option<ModelSource>,
+    table_cell_detection_type: Option<Result<TableType, String>>,
+    table_cell_detection_config: Option<TableCellDetectionConfig>,
+    table_structure_recognition_model: Option<ModelSource>,
+    table_structure_recognition_type: Option<Result<TableType, String>>,
+    table_structure_recognition_config: Option<TableStructureRecognitionConfig>,
+    table_structure_dict_path: Option<PathBuf>,
+    wired_table_structure_model: Option<ModelSource>,
+    wireless_table_structure_model: Option<ModelSource>,
+    wired_table_cell_model: Option<ModelSource>,
+    wireless_table_cell_model: Option<ModelSource>,
+    wired_table_structure_model_name: Option<String>,
+    wireless_table_structure_model_name: Option<String>,
+    wired_table_cell_model_name: Option<String>,
+    wireless_table_cell_model_name: Option<String>,
 }
 
 /// High-level builder for document structure analysis pipelines.
@@ -162,6 +209,8 @@ pub struct OARStructureBuilder {
     // Defaults: wired=false, wireless=false
     use_wired_table_cells_trans_to_html: bool,
     use_wireless_table_cells_trans_to_html: bool,
+    // Build table models on the first page that contains a table.
+    lazy_table_models: bool,
 
     // Optional formula recognition
     formula_recognition_model: Option<ModelSource>,
@@ -294,6 +343,7 @@ impl OARStructureBuilder {
             use_e2e_wireless_table_rec: true,
             use_wired_table_cells_trans_to_html: false,
             use_wireless_table_cells_trans_to_html: false,
+            lazy_table_models: false,
             formula_recognition_model: None,
             formula_recognition_type: None,
             formula_tokenizer_path: None,
@@ -665,6 +715,22 @@ impl OARStructureBuilder {
         }
         self.table_structure_recognition_model = Some(model_source.into());
         self.table_structure_recognition_type = Some(table_type);
+        self
+    }
+
+    /// Defers building the table models until a page contains a table.
+    ///
+    /// The table stack is the largest part of a typical structure pipeline
+    /// (the RT-DETR-L cell detectors and SLANeXt structure models alone are
+    /// about 1 GB of weights), yet many documents have no tables at all. With
+    /// this enabled, [`build`](Self::build) only checks that the table models
+    /// and dictionary exist; the sessions are created the first time layout
+    /// detection finds a table, and
+    /// [`OARStructure::release_table_models`] drops them again.
+    ///
+    /// The first page with a table pays the load time. Disabled by default.
+    pub fn lazy_table_models(mut self, enable: bool) -> Self {
+        self.lazy_table_models = enable;
         self
     }
 
@@ -1045,6 +1111,336 @@ impl OARStructureBuilder {
             None
         };
 
+        let table_spec = TableModelSpec::from_builder(&self);
+        let tables = if self.lazy_table_models && table_spec.has_models() {
+            table_spec.validate()?;
+            TableModelSlot::Lazy {
+                spec: Box::new(table_spec),
+                loaded: std::sync::Mutex::new(None),
+            }
+        } else {
+            TableModelSlot::Eager(Arc::new(table_spec.build()?))
+        };
+
+        // Build formula recognition adapter if enabled
+        let formula_recognition_adapter =
+            if let Some(ref model_path) = self.formula_recognition_model {
+                let tokenizer_path = self.formula_tokenizer_path.as_ref().ok_or_else(|| {
+                    OCRError::config_error_detailed(
+                        "formula_recognition",
+                        "Tokenizer path is required for formula recognition".to_string(),
+                    )
+                })?;
+
+                let model_type = match self.formula_recognition_type.as_ref() {
+                    Some(Ok(model_type)) => *model_type,
+                    Some(Err(message)) => {
+                        return Err(OCRError::config_error_detailed(
+                            "formula_recognition",
+                            message.clone(),
+                        ));
+                    }
+                    None => {
+                        return Err(OCRError::config_error_detailed(
+                            "formula_recognition",
+                            "Formula model kind is required".to_string(),
+                        ));
+                    }
+                };
+
+                let adapter: FormulaRecognitionAdapter = match model_type {
+                    FormulaModelKind::PPFormulaNet => {
+                        let mut builder = PPFormulaNetAdapterBuilder::new();
+
+                        builder = builder.tokenizer_path(tokenizer_path);
+
+                        if let Some(ref config) = self.formula_recognition_config {
+                            builder = builder.task_config(config.clone());
+                        }
+
+                        if let Some(ort_config) = self
+                            .formula_ort_session_config
+                            .as_ref()
+                            .or(self.ort_session_config.as_ref())
+                        {
+                            builder = builder.with_ort_config(ort_config.clone());
+                        }
+
+                        builder.build(model_path)?
+                    }
+                    FormulaModelKind::UniMERNet => {
+                        let mut builder = UniMERNetAdapterBuilder::new();
+
+                        builder = builder.tokenizer_path(tokenizer_path);
+
+                        if let Some(ref config) = self.formula_recognition_config {
+                            builder = builder.task_config(config.clone());
+                        }
+
+                        if let Some(ort_config) = self
+                            .formula_ort_session_config
+                            .as_ref()
+                            .or(self.ort_session_config.as_ref())
+                        {
+                            builder = builder.with_ort_config(ort_config.clone());
+                        }
+
+                        builder.build(model_path)?
+                    }
+                };
+
+                Some(adapter)
+            } else {
+                None
+            };
+
+        // Build seal text detection adapter if enabled
+        let seal_text_detection_adapter =
+            if let Some(ref model_path) = self.seal_text_detection_model {
+                let mut builder = SealTextDetectionAdapterBuilder::new();
+
+                if let Some(ref ort_config) = self.ort_session_config {
+                    builder = builder.with_ort_config(ort_config.clone());
+                }
+
+                Some(builder.build(model_path)?)
+            } else {
+                None
+            };
+
+        // Build text detection adapter if enabled.
+        //
+        // PP-StructureV3 overall OCR uses DB preprocess with:
+        // - limit_side_len=736
+        // - limit_type="min"
+        // - max_side_limit=4000
+        // We fill these defaults here (only for the structure pipeline) unless the caller
+        // explicitly overrides them via `text_detection_config`.
+        let text_detection_adapter = if let Some(ref model_path) = self.text_detection_model {
+            let mut builder = TextDetectionAdapterBuilder::new();
+
+            let mut effective_cfg = self.text_detection_config.clone().unwrap_or_default();
+
+            // Table-heavy documents are sensitive to detection fragmentation.
+            // Match PaddleX's lower table-scene threshold when users don't override config.
+            let has_table_pipeline = self.table_classification_model.is_some()
+                || self.table_structure_recognition_model.is_some()
+                || self.wired_table_structure_model.is_some()
+                || self.wireless_table_structure_model.is_some()
+                || self.table_cell_detection_model.is_some()
+                || self.wired_table_cell_model.is_some()
+                || self.wireless_table_cell_model.is_some();
+            if self.text_detection_config.is_none() && has_table_pipeline {
+                effective_cfg.box_threshold = 0.4;
+            }
+
+            if effective_cfg.limit_side_len.is_none() {
+                effective_cfg.limit_side_len = Some(736);
+            }
+            if effective_cfg.limit_type.is_none() {
+                effective_cfg.limit_type = Some(crate::processors::LimitType::Min);
+            }
+            if effective_cfg.max_side_len.is_none() {
+                effective_cfg.max_side_len = Some(4000);
+            }
+            builder = builder.with_config(effective_cfg);
+
+            // Label the detector with the caller-provided preset name (e.g.
+            // `PP-OCRv5_server_det`) for logs/errors. Detection behavior is
+            // driven by the config and ONNX model, not the name.
+            if let Some(ref name) = self.text_detection_model_name {
+                builder = builder.model_name(name.clone());
+            }
+
+            if let Some(ref ort_config) = self.ort_session_config {
+                builder = builder.with_ort_config(ort_config.clone());
+            }
+
+            Some(builder.build(model_path)?)
+        } else {
+            None
+        };
+
+        // Build text line orientation adapter if enabled (PP-StructureV3)
+        let text_line_orientation_adapter =
+            if let Some(ref model_path) = self.text_line_orientation_model {
+                let mut builder = TextLineOrientationAdapterBuilder::new();
+
+                if let Some(ref ort_config) = self.ort_session_config {
+                    builder = builder.with_ort_config(ort_config.clone());
+                }
+
+                Some(builder.build(model_path)?)
+            } else {
+                None
+            };
+
+        // Build text recognition adapter if enabled
+        let text_recognition_adapter = if let Some(ref model_path) = self.text_recognition_model {
+            let dict = char_dict.ok_or_else(|| OCRError::InvalidInput {
+                message: "Character dictionary is required for text recognition".to_string(),
+            })?;
+
+            // Parse dict into Vec<String> - one character per line
+            let char_vec: Vec<String> = dict.lines().map(|s| s.to_string()).collect();
+
+            let mut builder = TextRecognitionAdapterBuilder::new()
+                .character_dict(char_vec)
+                .return_word_box(self.return_word_box);
+
+            if let Some(ref config) = self.text_recognition_config {
+                builder = builder.with_config(config.clone());
+            }
+
+            // Label the recognizer with the caller-provided preset name (e.g.
+            // `PP-OCRv5_server_rec`) for logs/errors. Recognition behavior is
+            // driven by the config, dictionary, and ONNX model, not the name.
+            if let Some(ref name) = self.text_recognition_model_name {
+                builder = builder.model_name(name.clone());
+            }
+
+            if let Some(ref ort_config) = self.ort_session_config {
+                builder = builder.with_ort_config(ort_config.clone());
+            }
+
+            Some(builder.build(model_path)?)
+        } else {
+            None
+        };
+
+        let pipeline = StructurePipeline {
+            document_orientation_adapter,
+            rectification_adapter,
+            layout_detection_adapter,
+            region_detection_adapter,
+            tables,
+            use_e2e_wired_table_rec: self.use_e2e_wired_table_rec,
+            use_e2e_wireless_table_rec: self.use_e2e_wireless_table_rec,
+            use_wired_table_cells_trans_to_html: self.use_wired_table_cells_trans_to_html,
+            use_wireless_table_cells_trans_to_html: self.use_wireless_table_cells_trans_to_html,
+            formula_recognition_adapter,
+            seal_text_detection_adapter,
+            text_detection_adapter,
+            text_line_orientation_adapter,
+            text_recognition_adapter,
+            image_batch_size: self.image_batch_size,
+            region_batch_size: self.region_batch_size,
+        };
+
+        Ok(OARStructure { pipeline })
+    }
+
+    fn validate_batch_size(field: &str, size: usize) -> Result<(), OCRError> {
+        if size == 0 || size > Self::MAX_BATCH_SIZE {
+            return Err(OCRError::validation_error(
+                "OARStructureBuilder",
+                field,
+                &format!("1..={}", Self::MAX_BATCH_SIZE),
+                &size.to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl TableModelSpec {
+    fn from_builder(builder: &OARStructureBuilder) -> Self {
+        Self {
+            ort_session_config: builder.ort_session_config.clone(),
+            table_classification_model: builder.table_classification_model.clone(),
+            table_classification_config: builder.table_classification_config.clone(),
+            table_orientation_model: builder.table_orientation_model.clone(),
+            table_cell_detection_model: builder.table_cell_detection_model.clone(),
+            table_cell_detection_type: builder.table_cell_detection_type.clone(),
+            table_cell_detection_config: builder.table_cell_detection_config.clone(),
+            table_structure_recognition_model: builder.table_structure_recognition_model.clone(),
+            table_structure_recognition_type: builder.table_structure_recognition_type.clone(),
+            table_structure_recognition_config: builder.table_structure_recognition_config.clone(),
+            table_structure_dict_path: builder.table_structure_dict_path.clone(),
+            wired_table_structure_model: builder.wired_table_structure_model.clone(),
+            wireless_table_structure_model: builder.wireless_table_structure_model.clone(),
+            wired_table_cell_model: builder.wired_table_cell_model.clone(),
+            wireless_table_cell_model: builder.wireless_table_cell_model.clone(),
+            wired_table_structure_model_name: builder.wired_table_structure_model_name.clone(),
+            wireless_table_structure_model_name: builder
+                .wireless_table_structure_model_name
+                .clone(),
+            wired_table_cell_model_name: builder.wired_table_cell_model_name.clone(),
+            wireless_table_cell_model_name: builder.wireless_table_cell_model_name.clone(),
+        }
+    }
+
+    fn model_sources(&self) -> [(&'static str, Option<&ModelSource>); 8] {
+        [
+            (
+                "table_classification",
+                self.table_classification_model.as_ref(),
+            ),
+            ("table_orientation", self.table_orientation_model.as_ref()),
+            (
+                "table_cell_detection",
+                self.table_cell_detection_model.as_ref(),
+            ),
+            (
+                "table_structure_recognition",
+                self.table_structure_recognition_model.as_ref(),
+            ),
+            (
+                "wired_table_structure",
+                self.wired_table_structure_model.as_ref(),
+            ),
+            (
+                "wireless_table_structure",
+                self.wireless_table_structure_model.as_ref(),
+            ),
+            (
+                "wired_table_cell_detection",
+                self.wired_table_cell_model.as_ref(),
+            ),
+            (
+                "wireless_table_cell_detection",
+                self.wireless_table_cell_model.as_ref(),
+            ),
+        ]
+    }
+
+    fn has_models(&self) -> bool {
+        self.model_sources()
+            .iter()
+            .any(|(_, source)| source.is_some())
+    }
+
+    /// The checks `build` would fail on, without creating any session, so a
+    /// lazily loaded pipeline still reports a bad configuration up front.
+    fn validate(&self) -> Result<(), OCRError> {
+        for (component, source) in self.model_sources() {
+            if let Some(path) = source.and_then(ModelSource::as_path)
+                && !path.is_file()
+            {
+                return Err(OCRError::config_error_detailed(
+                    component,
+                    format!("model file not found: {}", path.display()),
+                ));
+            }
+        }
+        let needs_dict = self.table_structure_recognition_model.is_some()
+            || self.wired_table_structure_model.is_some()
+            || self.wireless_table_structure_model.is_some();
+        match &self.table_structure_dict_path {
+            None if needs_dict => Err(OCRError::config_error_detailed(
+                "table_structure_recognition",
+                "Dictionary path is required. Call table_structure_dict_path() when enabling table structure recognition.".to_string(),
+            )),
+            Some(dict) if needs_dict && !dict.is_file() => Err(OCRError::config_error_detailed(
+                "table_structure_recognition",
+                format!("dictionary file not found: {}", dict.display()),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn build(&self) -> Result<TableModels, OCRError> {
         // Build table classification adapter if enabled
         let table_classification_adapter =
             if let Some(ref model_path) = self.table_classification_model {
@@ -1290,197 +1686,7 @@ impl OARStructureBuilder {
             None
         };
 
-        // Build formula recognition adapter if enabled
-        let formula_recognition_adapter =
-            if let Some(ref model_path) = self.formula_recognition_model {
-                let tokenizer_path = self.formula_tokenizer_path.as_ref().ok_or_else(|| {
-                    OCRError::config_error_detailed(
-                        "formula_recognition",
-                        "Tokenizer path is required for formula recognition".to_string(),
-                    )
-                })?;
-
-                let model_type = match self.formula_recognition_type.as_ref() {
-                    Some(Ok(model_type)) => *model_type,
-                    Some(Err(message)) => {
-                        return Err(OCRError::config_error_detailed(
-                            "formula_recognition",
-                            message.clone(),
-                        ));
-                    }
-                    None => {
-                        return Err(OCRError::config_error_detailed(
-                            "formula_recognition",
-                            "Formula model kind is required".to_string(),
-                        ));
-                    }
-                };
-
-                let adapter: FormulaRecognitionAdapter = match model_type {
-                    FormulaModelKind::PPFormulaNet => {
-                        let mut builder = PPFormulaNetAdapterBuilder::new();
-
-                        builder = builder.tokenizer_path(tokenizer_path);
-
-                        if let Some(ref config) = self.formula_recognition_config {
-                            builder = builder.task_config(config.clone());
-                        }
-
-                        if let Some(ort_config) = self
-                            .formula_ort_session_config
-                            .as_ref()
-                            .or(self.ort_session_config.as_ref())
-                        {
-                            builder = builder.with_ort_config(ort_config.clone());
-                        }
-
-                        builder.build(model_path)?
-                    }
-                    FormulaModelKind::UniMERNet => {
-                        let mut builder = UniMERNetAdapterBuilder::new();
-
-                        builder = builder.tokenizer_path(tokenizer_path);
-
-                        if let Some(ref config) = self.formula_recognition_config {
-                            builder = builder.task_config(config.clone());
-                        }
-
-                        if let Some(ort_config) = self
-                            .formula_ort_session_config
-                            .as_ref()
-                            .or(self.ort_session_config.as_ref())
-                        {
-                            builder = builder.with_ort_config(ort_config.clone());
-                        }
-
-                        builder.build(model_path)?
-                    }
-                };
-
-                Some(adapter)
-            } else {
-                None
-            };
-
-        // Build seal text detection adapter if enabled
-        let seal_text_detection_adapter =
-            if let Some(ref model_path) = self.seal_text_detection_model {
-                let mut builder = SealTextDetectionAdapterBuilder::new();
-
-                if let Some(ref ort_config) = self.ort_session_config {
-                    builder = builder.with_ort_config(ort_config.clone());
-                }
-
-                Some(builder.build(model_path)?)
-            } else {
-                None
-            };
-
-        // Build text detection adapter if enabled.
-        //
-        // PP-StructureV3 overall OCR uses DB preprocess with:
-        // - limit_side_len=736
-        // - limit_type="min"
-        // - max_side_limit=4000
-        // We fill these defaults here (only for the structure pipeline) unless the caller
-        // explicitly overrides them via `text_detection_config`.
-        let text_detection_adapter = if let Some(ref model_path) = self.text_detection_model {
-            let mut builder = TextDetectionAdapterBuilder::new();
-
-            let mut effective_cfg = self.text_detection_config.clone().unwrap_or_default();
-
-            // Table-heavy documents are sensitive to detection fragmentation.
-            // Match PaddleX's lower table-scene threshold when users don't override config.
-            let has_table_pipeline = self.table_classification_model.is_some()
-                || self.table_structure_recognition_model.is_some()
-                || self.wired_table_structure_model.is_some()
-                || self.wireless_table_structure_model.is_some()
-                || self.table_cell_detection_model.is_some()
-                || self.wired_table_cell_model.is_some()
-                || self.wireless_table_cell_model.is_some();
-            if self.text_detection_config.is_none() && has_table_pipeline {
-                effective_cfg.box_threshold = 0.4;
-            }
-
-            if effective_cfg.limit_side_len.is_none() {
-                effective_cfg.limit_side_len = Some(736);
-            }
-            if effective_cfg.limit_type.is_none() {
-                effective_cfg.limit_type = Some(crate::processors::LimitType::Min);
-            }
-            if effective_cfg.max_side_len.is_none() {
-                effective_cfg.max_side_len = Some(4000);
-            }
-            builder = builder.with_config(effective_cfg);
-
-            // Label the detector with the caller-provided preset name (e.g.
-            // `PP-OCRv5_server_det`) for logs/errors. Detection behavior is
-            // driven by the config and ONNX model, not the name.
-            if let Some(ref name) = self.text_detection_model_name {
-                builder = builder.model_name(name.clone());
-            }
-
-            if let Some(ref ort_config) = self.ort_session_config {
-                builder = builder.with_ort_config(ort_config.clone());
-            }
-
-            Some(builder.build(model_path)?)
-        } else {
-            None
-        };
-
-        // Build text line orientation adapter if enabled (PP-StructureV3)
-        let text_line_orientation_adapter =
-            if let Some(ref model_path) = self.text_line_orientation_model {
-                let mut builder = TextLineOrientationAdapterBuilder::new();
-
-                if let Some(ref ort_config) = self.ort_session_config {
-                    builder = builder.with_ort_config(ort_config.clone());
-                }
-
-                Some(builder.build(model_path)?)
-            } else {
-                None
-            };
-
-        // Build text recognition adapter if enabled
-        let text_recognition_adapter = if let Some(ref model_path) = self.text_recognition_model {
-            let dict = char_dict.ok_or_else(|| OCRError::InvalidInput {
-                message: "Character dictionary is required for text recognition".to_string(),
-            })?;
-
-            // Parse dict into Vec<String> - one character per line
-            let char_vec: Vec<String> = dict.lines().map(|s| s.to_string()).collect();
-
-            let mut builder = TextRecognitionAdapterBuilder::new()
-                .character_dict(char_vec)
-                .return_word_box(self.return_word_box);
-
-            if let Some(ref config) = self.text_recognition_config {
-                builder = builder.with_config(config.clone());
-            }
-
-            // Label the recognizer with the caller-provided preset name (e.g.
-            // `PP-OCRv5_server_rec`) for logs/errors. Recognition behavior is
-            // driven by the config, dictionary, and ONNX model, not the name.
-            if let Some(ref name) = self.text_recognition_model_name {
-                builder = builder.model_name(name.clone());
-            }
-
-            if let Some(ref ort_config) = self.ort_session_config {
-                builder = builder.with_ort_config(ort_config.clone());
-            }
-
-            Some(builder.build(model_path)?)
-        } else {
-            None
-        };
-
-        let pipeline = StructurePipeline {
-            document_orientation_adapter,
-            rectification_adapter,
-            layout_detection_adapter,
-            region_detection_adapter,
+        Ok(TableModels {
             table_classification_adapter,
             table_orientation_adapter,
             table_cell_detection_adapter,
@@ -1489,33 +1695,7 @@ impl OARStructureBuilder {
             wireless_table_structure_adapter,
             wired_table_cell_adapter,
             wireless_table_cell_adapter,
-            use_e2e_wired_table_rec: self.use_e2e_wired_table_rec,
-            use_e2e_wireless_table_rec: self.use_e2e_wireless_table_rec,
-            use_wired_table_cells_trans_to_html: self.use_wired_table_cells_trans_to_html,
-            use_wireless_table_cells_trans_to_html: self.use_wireless_table_cells_trans_to_html,
-            formula_recognition_adapter,
-            seal_text_detection_adapter,
-            text_detection_adapter,
-            text_line_orientation_adapter,
-            text_recognition_adapter,
-            image_batch_size: self.image_batch_size,
-            region_batch_size: self.region_batch_size,
-        };
-
-        Ok(OARStructure { pipeline })
-    }
-
-    fn validate_batch_size(field: &str, size: usize) -> Result<(), OCRError> {
-        if size == 0 || size > Self::MAX_BATCH_SIZE {
-            return Err(OCRError::validation_error(
-                "OARStructureBuilder",
-                field,
-                &format!("1..={}", Self::MAX_BATCH_SIZE),
-                &size.to_string(),
-            ));
-        }
-
-        Ok(())
+        })
     }
 }
 
@@ -1540,6 +1720,70 @@ struct PreparedPage {
 }
 
 impl OARStructure {
+    /// Table adapters for a page. In lazy mode they are built the first time a
+    /// page `needs` them; pages without tables get an empty set.
+    fn table_models(&self, needed: bool) -> Result<Arc<TableModels>, OCRError> {
+        let (spec, loaded) = match &self.pipeline.tables {
+            TableModelSlot::Eager(models) => return Ok(Arc::clone(models)),
+            TableModelSlot::Lazy { spec, loaded } => (spec, loaded),
+        };
+        if !needed {
+            return Ok(Arc::new(TableModels::default()));
+        }
+        // Holding the lock while building keeps concurrent pages from loading
+        // the same models twice.
+        let mut slot = loaded.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(models) = slot.as_ref() {
+            return Ok(Arc::clone(models));
+        }
+        let t_load = Instant::now();
+        let models = Arc::new(spec.build()?);
+        tracing::info!(
+            "loaded table models on demand in {:.1} ms",
+            t_load.elapsed().as_secs_f64() * 1000.0
+        );
+        *slot = Some(Arc::clone(&models));
+        Ok(models)
+    }
+
+    /// Drops table models that were loaded on demand, returning whether any
+    /// were loaded.
+    ///
+    /// Only applies to pipelines built with
+    /// [`OARStructureBuilder::lazy_table_models`]; the next page with a table
+    /// loads them again. Pages already running keep their own reference, so
+    /// the memory is freed once they finish.
+    pub fn release_table_models(&self) -> bool {
+        match &self.pipeline.tables {
+            TableModelSlot::Eager(_) => false,
+            TableModelSlot::Lazy { loaded, .. } => loaded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .is_some(),
+        }
+    }
+
+    /// Whether the table models are currently loaded. Always `true` for an
+    /// eagerly built pipeline that has table models.
+    pub fn table_models_loaded(&self) -> bool {
+        match &self.pipeline.tables {
+            TableModelSlot::Eager(models) => {
+                models.table_classification_adapter.is_some()
+                    || models.table_orientation_adapter.is_some()
+                    || models.table_cell_detection_adapter.is_some()
+                    || models.table_structure_recognition_adapter.is_some()
+                    || models.wired_table_structure_adapter.is_some()
+                    || models.wireless_table_structure_adapter.is_some()
+                    || models.wired_table_cell_adapter.is_some()
+                    || models.wireless_table_cell_adapter.is_some()
+            }
+            TableModelSlot::Lazy { loaded, .. } => {
+                loaded.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+            }
+        }
+    }
+
     fn finish_layout_elements(layout_elements: &mut Vec<crate::domain::structure::LayoutElement>) {
         if layout_elements.len() > 1 {
             let removed = crate::domain::structure::remove_overlapping_layout_elements(
@@ -2890,31 +3134,30 @@ impl OARStructure {
 
         {
             let t_tables = Instant::now();
+            let has_table = layout_elements
+                .iter()
+                .any(|e| e.element_type == crate::domain::structure::LayoutElementType::Table);
+            let table_models = self.table_models(has_table)?;
             let analyzer = crate::oarocr::table_analyzer::TableAnalyzer::new(
                 crate::oarocr::table_analyzer::TableAnalyzerConfig {
-                    table_classification_adapter: self
-                        .pipeline
+                    table_classification_adapter: table_models
                         .table_classification_adapter
                         .as_ref(),
-                    table_orientation_adapter: self.pipeline.table_orientation_adapter.as_ref(),
-                    table_structure_recognition_adapter: self
-                        .pipeline
+                    table_orientation_adapter: table_models.table_orientation_adapter.as_ref(),
+                    table_structure_recognition_adapter: table_models
                         .table_structure_recognition_adapter
                         .as_ref(),
-                    wired_table_structure_adapter: self
-                        .pipeline
+                    wired_table_structure_adapter: table_models
                         .wired_table_structure_adapter
                         .as_ref(),
-                    wireless_table_structure_adapter: self
-                        .pipeline
+                    wireless_table_structure_adapter: table_models
                         .wireless_table_structure_adapter
                         .as_ref(),
-                    table_cell_detection_adapter: self
-                        .pipeline
+                    table_cell_detection_adapter: table_models
                         .table_cell_detection_adapter
                         .as_ref(),
-                    wired_table_cell_adapter: self.pipeline.wired_table_cell_adapter.as_ref(),
-                    wireless_table_cell_adapter: self.pipeline.wireless_table_cell_adapter.as_ref(),
+                    wired_table_cell_adapter: table_models.wired_table_cell_adapter.as_ref(),
+                    wireless_table_cell_adapter: table_models.wireless_table_cell_adapter.as_ref(),
                     use_e2e_wired_table_rec: self.pipeline.use_e2e_wired_table_rec,
                     use_e2e_wireless_table_rec: self.pipeline.use_e2e_wireless_table_rec,
                     use_wired_table_cells_trans_to_html: self
@@ -3790,6 +4033,57 @@ impl OARStructure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn existing_file(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("oar-lazy-table-{}-{}", std::process::id(), name));
+        std::fs::write(&path, b"x").expect("write temp file");
+        path
+    }
+
+    #[test]
+    fn table_spec_without_table_models_is_built_eagerly() {
+        let builder = OARStructureBuilder::new("layout.onnx").lazy_table_models(true);
+        let spec = TableModelSpec::from_builder(&builder);
+        assert!(!spec.has_models());
+        let models = spec.build().expect("an empty table stack builds");
+        assert!(models.wired_table_structure_adapter.is_none());
+    }
+
+    #[test]
+    fn lazy_table_spec_reports_missing_model_files_up_front() {
+        let dict = existing_file("dict.txt");
+        let builder = OARStructureBuilder::new("layout.onnx")
+            .lazy_table_models(true)
+            .with_wired_table_structure("does-not-exist/slanext_wired.onnx")
+            .table_structure_dict_path(&dict);
+        let spec = TableModelSpec::from_builder(&builder);
+        assert!(spec.has_models());
+        let err = spec
+            .validate()
+            .expect_err("missing model must fail validation");
+        assert!(err.to_string().contains("slanext_wired.onnx"), "{err}");
+        let _ = std::fs::remove_file(dict);
+    }
+
+    #[test]
+    fn lazy_table_spec_requires_the_structure_dictionary() {
+        let model = existing_file("slanext_wired.onnx");
+        let builder = OARStructureBuilder::new("layout.onnx")
+            .lazy_table_models(true)
+            .with_wired_table_structure(&model);
+        let spec = TableModelSpec::from_builder(&builder);
+        let err = spec
+            .validate()
+            .expect_err("missing dictionary must fail validation");
+        assert!(err.to_string().contains("Dictionary path"), "{err}");
+
+        let dict = existing_file("table_dict.txt");
+        let spec = TableModelSpec::from_builder(&builder.table_structure_dict_path(&dict));
+        spec.validate().expect("model and dictionary exist");
+        let _ = std::fs::remove_file(model);
+        let _ = std::fs::remove_file(dict);
+    }
 
     #[test]
     fn pp_structurev3_preset_sets_the_benchmark_stack() {
