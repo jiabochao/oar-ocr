@@ -5,13 +5,21 @@ const MODEL_MODULES: &[&str] = &[
     "glmocr",
     "hpd_parsing",
     "hunyuanocr",
+    "jina_ocr",
     "mineru",
     "mineru_diffusion",
+    "minicpm_ocr",
     "monkeyocrv2",
-    "navidc_ocr",
     "ovisocr2",
+    "ovisocr3",
+    "oxr",
     "paddleocr_vl",
     "pp_doclayout",
+    "teleocr",
+    "unlimited_ocr",
+    "wevisdoc",
+    "xiaomi_ocr",
+    "youtu_parsing_omni",
 ];
 
 fn collect_rust_sources(dir: &Path, sources: &mut Vec<std::path::PathBuf>) {
@@ -61,6 +69,10 @@ fn validate_architecture() {
         }
         for model in MODEL_MODULES {
             if model_owner == Some(*model) {
+                continue;
+            }
+            // OvisOCR3 is a prompt/protocol wrapper around the OvisOCR2 engine.
+            if model_owner == Some("ovisocr3") && *model == "ovisocr2" {
                 continue;
             }
             let dependency = format!("crate::{model}::");

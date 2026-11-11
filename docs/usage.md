@@ -6,6 +6,34 @@ This guide covers the detailed usage of OAROCR for text recognition and document
 
 ### Simple Usage
 
+The `pp_ocrv6` preset selects the models, dictionary, and official detection thresholds for a PP-OCRv6 size, so the pipeline is one line. With the `auto-download` feature the names resolve through the model registry; without it they resolve as local paths, like any other model source.
+
+```rust
+use oar_ocr::prelude::*;
+use std::path::Path;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Build a PP-OCRv6 pipeline at the chosen size
+    let ocr = OAROCRBuilder::pp_ocrv6(PpOcrV6Size::Small).build()?;
+
+    // Process a single image
+    let image = load_image(Path::new("document.jpg"))?;
+    let results = ocr.predict(vec![image])?;
+    let result = &results[0];
+
+    // Print extracted text with confidence scores
+    for text_region in &result.text_regions {
+        if let Some((text, confidence)) = text_region.text_with_confidence() {
+            println!("Text: {} (confidence: {:.2})", text, confidence);
+        }
+    }
+
+    Ok(())
+}
+```
+
+The explicit form, for choosing every model yourself:
+
 ```rust
 use oar_ocr::prelude::*;
 use std::path::Path;
@@ -123,7 +151,16 @@ In-memory sources skip auto-download resolution, and models that reference exter
 
 ### OARStructureBuilder - Document Structure Analysis
 
-The `OARStructureBuilder` enables document structure analysis with layout detection, table recognition, and formula extraction:
+The `OARStructureBuilder` enables document structure analysis with layout detection, table recognition, and formula extraction. The `pp_structurev3` preset wires the full PP-StructureV3-style stack in one call — PP-DocLayoutV3 layout, PP-OCRv6 Tiny OCR, table classification, SLANeXt wired and SLANet+ wireless table structure, wired cell detection, and the table dictionary:
+
+```rust
+use oar_ocr::oarocr::OARStructureBuilder;
+
+// Full PP-StructureV3-style document analysis in one call
+let structure = OARStructureBuilder::pp_structurev3().build()?;
+```
+
+Each component can also be selected explicitly to build a custom pipeline, for example with a single wired table model:
 
 ```rust
 use oar_ocr::oarocr::OARStructureBuilder;
@@ -169,7 +206,67 @@ let structure = OARStructureBuilder::new("picodet-l_layout_17cls.onnx")
 | `.region_batch_size(n)` | Set batch size for region processing |
 | `.ort_session(config)` | Apply ONNX Runtime configuration |
 
+### IndraOcrBuilder - Indra OCR
+
+[Indra OCR](https://huggingface.co/datalab-to/indra-ocr) is Datalab's CPU-first page reader: small ONNX models (about 76 MB, 46 MB of them n-gram language models for lines a recognizer is unsure of) that turn a page into lines with boxes, layout blocks in reading order (text, section headers, lists, tables, captions, footnotes, page headers and footers), and Markdown with tables as HTML. A script classifier sends each line to one of four recognizers: Latin, Cyrillic, and Greek (including handwriting); Chinese, Japanese, and Korean; Arabic, Persian, Urdu, and Hebrew (read into logical order, with right-to-left pages read right column first); and Indic, Thai, Lao, Khmer, Georgian, Armenian, and other scripts. It turns quarter-turned pages upright, straightens tilts up to 45 degrees, reads light text on dark ground, and reads Chinese and Japanese pages set in vertical columns. `oar_ocr::indra` reproduces the reference pipeline's OCR mode (`indra-ocr` 1.1.2 with the v1.1.0 models; the earlier v3.1 model set still loads), with two fixes: token positions from the tall-window recognizer are no longer stretched, which moves some split-line boxes, and tables built from the table heads no longer drop a cell that a neighbour's span would cover. Reading a PDF's own text layer is not supported, so render PDF pages to images first. Download the models from Hugging Face; they are not part of the auto-download registry, and their weights use a modified OpenRAIL-M license.
+
+The [`oar indra` command](../oar-ocr-cli/README.md#indra-ocr) downloads its checkpoint directly from Hugging Face and accepts images or rasterized PDF pages. Use `--model-dir` for an existing local checkpoint.
+
+```bash
+oar indra document.pdf --device cpu --workers 4 --pages 1-8 -o pages
+oar indra page.png --device cuda:0 --format json
+```
+
+```bash
+hf download datalab-to/indra-ocr --local-dir models/datalab-to/indra-ocr
+```
+
+```rust,no_run
+use oar_ocr::indra::IndraOcrBuilder;
+use oar_ocr::utils::load_image;
+
+let ocr = IndraOcrBuilder::new("models/datalab-to/indra-ocr")
+    .math(true) // write lines with math as inline LaTeX
+    .build()?;
+let page = ocr.predict(vec![load_image("page.png")?])?.remove(0);
+println!("{}", page.markdown);
+for block in &page.blocks {
+    println!("{} {:?}", block.label, block.bbox);
+}
+let json = page.to_json(); // the shared page JSON, with pipeline "indra"
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+| Method | Description |
+|--------|-------------|
+| `.math(bool)` | Read lines with math as text with inline LaTeX (off by default; needs the `math_*` model files) |
+| `.keep_furniture(bool)` | Keep page headers and footers in the Markdown (left out by default; always listed in `blocks`) |
+| `.table_heads(bool)` | Build tables from the order model's row, column and cell heads instead of from line geometry (off by default, as in the reference; a table the heads fail on falls back to geometry) |
+| `.workers(usize)` | CPU page workers (default: 1); each has its own ONNX sessions and shares vocabularies and language models |
+| `.ort_session(config)` | Apply ONNX Runtime configuration to every model |
+
+Pass several images to one `predict` call to use the workers; up to the configured number of pages are read concurrently, and pages and errors retain input order. With multiple workers, unset ONNX intra/inter-op thread counts default to one. Explicit thread settings are honored; keep workers times threads within the available cores. Per-page preprocessing uses those worker threads rather than the global pool, so a small worker count also limits preprocessing parallelism. An application-configured global ONNX Runtime thread pool retains its process-wide settings. The default single-worker path is unchanged.
+
+On an Intel Core i9-13900KF (8 performance cores and 16 efficiency cores), warmed runs with the v1.1.0 models, ONNX intra/inter-op threads set to one, and optional math and table heads disabled measured 1.62 pages/s with one worker on 48 pages. Repeating those pages six times (288 pages) measured 7.9 pages/s with 8 workers, 8.6 with 16, and 8.5 with 32. Throughput stopped rising beyond the 16 performance-core threads in this test; start with workers equal to the number of performance-core threads and measure on your own hardware.
+
+Memory grows with the number of workers: peak RSS on the 48-page set rose from about 3 GB with 1 worker to about 5 GB with 16. Each worker owns model sessions, activation arenas, and temporary page buffers, while vocabularies and n-gram language models are shared.
+
+For CUDA, build with `--features cuda` and select the CUDA execution provider through `.ort_session(config)`, as in [GPU Acceleration](#gpu-acceleration). Accelerator configurations require `.workers(1)`; larger values return a configuration error. The example accepts `--device cuda:0`. On an RTX 4090, the 48-page set reached 2.6 pages/s, about 1.6 times one CPU worker, with about 13 GB of VRAM; several CPU workers were faster on this workload. Recognized text matched CPU, but near-tie reading-order or table-column decisions can differ on a few pages.
+
+```bash
+cargo run --release --example indra -- --model-dir models/datalab-to/indra-ocr --workers 4 page1.png page2.png page3.png page4.png
+cargo run --release --features cuda --example indra -- --model-dir models/datalab-to/indra-ocr --device cuda:0 page.png
+```
+
+Boxes are in the upright page: `page.rotation` is the quarter turn that was undone and `page.width` / `page.height` its size, and `page.skew` the tilt that was straightened (boxes are mapped back across it). A page set in vertical columns has `page.vertical` set; it is read turned a quarter turn, but its boxes are on the page as it is and `page.rotation` stays 0.
+
 ## GPU Acceleration
+
+### Automatic Device Selection
+
+Examples default to `--device auto` (case-insensitive). Classic pipelines try compiled CUDA(0), CoreML on Apple platforms, and DirectML(0) on Windows, then CPU. Library callers opt in with `OrtSessionConfig::auto()`; existing defaults remain CPU, and `resolve_auto()` explicitly queries the resolved configuration. Failed registrations are omitted during construction, before choosing CPU batch defaults. TensorRT, OpenVINO, and WebGPU remain explicit choices because of initialization cost and compatibility. When CUDA is compiled but no GPU is available, ONNX Runtime prints an ERROR log during probing: `CUDA failure 100: no CUDA-capable device is detected`. This is expected; execution then falls back to CPU.
+
+VL tries compiled CUDA(0), then Metal(0), then CPU. Use `oar_ocr_vl::auto_device()` or `oar_ocr_vl::utils::parse_device("auto")` in library code. Device creation failures fall back automatically; the existing dtype probe selects F32 on CPU and on accelerators without BF16 support, BF16 when the device supports it and a BF16 probe succeeds, or F16 when that probe fails. Use `--device cpu` to require CPU execution in either pipeline.
 
 ### CUDA
 
@@ -261,6 +358,10 @@ let ort_config = OrtSessionConfig::new()
     ]);
 ```
 
+## Vision-Language Page and Document Parsing
+
+`PageParser::parse_page` returns a `PageDocument` with normalized blocks, Markdown and diagnostics. `PageParser::parse_document` returns a `DocumentOutput` containing pages in input order, document Markdown and any raw joint response. Most backends parse pages independently and join the available Markdown; Unlimited-OCR-2 reads them in one joint request. See the [VL page and document API guide](../oar-ocr-vl/README.md#unified-page-parsing) for loading, options and joint-generation methods.
+
 ## PaddleOCR-VL
 
 [PaddleOCR-VL](https://huggingface.co/PaddlePaddle/PaddleOCR-VL) is a 0.9B document Vision-Language Model from the PaddlePaddle team. It supports 109 languages and task-specific recognition for text, tables, formulas, and charts.
@@ -269,20 +370,22 @@ This functionality is available in the separate `oar-ocr-vl` crate, using [Candl
 
 PaddleOCR-VL-1.5 and PaddleOCR-VL-1.6 are drop-in replacements via `PaddleOcrVl::from_dir`. Both add **text spotting** and **seal recognition** to the original model's task set.
 
+Chart-region recognition in `DocParser` is opt-in through `PaddleOcrVl::with_chart_recognition(true)`. See the [PaddleOCR-VL guide](../oar-ocr-vl/README.md#paddleocr-vl) for region processing and standalone tasks.
+
 ### Installation
 
 `oar-ocr-vl` is self-contained and runs on Candle, so it pulls in **no ONNX Runtime** and does not depend on `oar-ocr-core`:
 
 ```toml
 [dependencies]
-oar-ocr-vl = "0.9"
+oar-ocr-vl = "0.10"
 ```
 
 For GPU acceleration, enable CUDA:
 
 ```toml
 [dependencies]
-oar-ocr-vl = { version = "0.9", features = ["cuda"] }
+oar-ocr-vl = { version = "0.10", features = ["cuda"] }
 ```
 
 On macOS, use the `metal` feature instead.
@@ -454,9 +557,105 @@ cargo run -p oar-ocr-vl --features cuda --example ovisocr2 -- \
 
 Add `--keep-image-tags` to retain visual-region image-tag references, or use `--max-tokens` to override the 16,384-token default. The example does not create the referenced bounding-box crop files.
 
+## OvisOCR3
+
+[OvisOCR3](https://huggingface.co/ATH-MaaS/OvisOCR3) reuses the OvisOCR2 engine with its own verbatim task prompts. The explicit ID `ATH-MaaS/OvisOCR3` selects Markdown parsing through `AnyPageParser` and `oar parse --model ATH-MaaS/OvisOCR3`. Load the typed model to select structured output:
+
+```rust,no_run
+use candle_core::Device;
+use oar_ocr_vl::{OvisOcr3, OvisOcr3ParseMode, OvisOcr3ParseOptions, PageParser};
+use oar_ocr_vl::utils::image::load_image;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let model = OvisOcr3::from_dir("ATH-MaaS/OvisOCR3", Device::Cpu)?;
+    let image = load_image("document.png")?;
+    let options = OvisOcr3ParseOptions::default().with_mode(OvisOcr3ParseMode::Structured);
+    let page = model.parse_page(&image, &options)?;
+    println!("{}", page.to_json(image.width(), image.height()));
+    Ok(())
+}
+```
+
+Structured boxes refer to the image supplied to the model, including cropped inputs. Structured mode recovers complete objects from truncated JSON, uses full-page boxes for invalid coordinates, and records diagnostics. See the [crate guide](../oar-ocr-vl/README.md#ovisocr3) for coordinate conversion, task mappings, prompt constants, and post-processing options.
+
+`OvisOcr3::generate_joint_with_prompt` generates one response from several images. `reconstruct_tables` rebuilds tables across two adjacent pages; see the [joint-generation guide](../oar-ocr-vl/README.md#unified-page-parsing) for page-number handling and multi-page reconstruction.
+
+## MiniCPM-OCR 1.0
+
+[MiniCPM-OCR 1.0](https://huggingface.co/openbmb/MiniCPM-OCR-1.0) recognizes regions supplied by PP-DocLayout through the explicit model ID `openbmb/MiniCPM-OCR-1.0`, following the official SDK's layout-then-recognize pipeline.
+
+```rust,no_run
+use candle_core::Device;
+use oar_ocr_vl::{AnyPageParser, AnyPageParserLoadOptions, AnyPageParserModel, AnyPageParserOptions, PageParser};
+use oar_ocr_vl::utils::image::load_image;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let parser = AnyPageParser::from_dir_with_options(
+        AnyPageParserModel::MiniCpmOcr,
+        "openbmb/MiniCPM-OCR-1.0",
+        Device::Cpu,
+        &AnyPageParserLoadOptions::default()
+            .with_layout_dir("PaddlePaddle/PP-DocLayoutV3_safetensors"),
+    )?;
+    let page = parser.parse_page(&load_image("document.png")?, &AnyPageParserOptions::default())?;
+    println!("{}", page.markdown.unwrap_or_default());
+    Ok(())
+}
+```
+
+From the command line: `oar parse --model openbmb/MiniCPM-OCR-1.0 document.png`. See the [crate guide](../oar-ocr-vl/README.md#minicpm-ocr-10) for region tasks, slicing, and generation options.
+
+## OXR-1.0
+
+[OXR-1.0](https://huggingface.co/SoMarkAI/OXR-1.0) recognizes regions supplied by PP-DocLayout through the explicit model ID `SoMarkAI/OXR-1.0`. It predicts their reading order with its grounding prompt before recognition. `Oxr::with_reading_order(false)` selects the layout detector's order.
+
+```rust,no_run
+use candle_core::Device;
+use oar_ocr_vl::{AnyPageParser, AnyPageParserLoadOptions, AnyPageParserModel, AnyPageParserOptions, PageParser};
+use oar_ocr_vl::utils::image::load_image;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let parser = AnyPageParser::from_dir_with_options(
+        AnyPageParserModel::Oxr,
+        "SoMarkAI/OXR-1.0",
+        Device::Cpu,
+        &AnyPageParserLoadOptions::default()
+            .with_layout_dir("PaddlePaddle/PP-DocLayoutV3_safetensors"),
+    )?;
+    let page = parser.parse_page(&load_image("document.png")?, &AnyPageParserOptions::default())?;
+    println!("{}", page.markdown.unwrap_or_default());
+    Ok(())
+}
+```
+
+The weights are under [SoMark's OXR License](https://huggingface.co/SoMarkAI/OXR-1.0/blob/main/LICENSE), Apache 2.0 plus commercial thresholds, an attribution duty, and a ban on competing hosted APIs; users must accept these terms before using the weights.
+
+See the [crate guide](../oar-ocr-vl/README.md#oxr-10) for OXR tasks, PP-DocLayout integration, and generation options.
+
+## Unlimited-OCR-2
+
+[Unlimited-OCR-2](https://huggingface.co/baidu/Unlimited-OCR-2) parses whole pages to Markdown without an external layout model, and can read several pages in one request. Load it through the explicit model ID `baidu/Unlimited-OCR-2`:
+
+```rust,no_run
+use candle_core::Device;
+use oar_ocr_vl::{AnyPageParser, AnyPageParserModel, AnyPageParserOptions, PageParser};
+use oar_ocr_vl::utils::image::load_image;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let parser = AnyPageParser::from_dir(AnyPageParserModel::UnlimitedOcr2, "baidu/Unlimited-OCR-2", Device::Cpu)?;
+    let page = parser.parse_page(&load_image("document.png")?, &AnyPageParserOptions::default())?;
+    println!("{}", page.markdown.unwrap_or_default());
+    Ok(())
+}
+```
+
+From the command line: `oar parse --model baidu/Unlimited-OCR-2 document.png`. The page's layout blocks, with boxes, are in `page.blocks`. Multi-page `parse_document` uses one joint request and resolves `Auto` views to `Tiled`; explicit `Global` selects global views. Direct `generate` keeps its own `Auto` policy. See the [crate guide](../oar-ocr-vl/README.md#unlimited-ocr-2) for view modes, cross-page Markdown and decoding guards.
+
 ## MonkeyOCRv2-S/B-Parsing
 
 [MonkeyOCRv2-S-Parsing](https://huggingface.co/zenosai/MonkeyOCRv2-S-Parsing) and [MonkeyOCRv2-B-Parsing](https://huggingface.co/zenosai/MonkeyOCRv2-B-Parsing) are 0.6B and 0.7B document parsers. They pair Monkey ViT-S and ViT-B vision encoders, respectively, with the same Qwen3-0.6B decoder. The native Candle implementation reads either checkpoint's dimensions from its configuration and supports the five official tasks: `Layout`, `EndToEnd`, `Text`, `Formula`, and `Table`.
+
+`PageParser` defaults to a native layout pass followed by crop recognition through the shared `DocParser`. `with_two_stage_parsing(false)` selects one-pass page parsing; explicit `generate` calls run the requested task. `from_dir` enables full-page dewarp when both `preprocessor1.pth` and `preprocessor2.pth` are present. `with_dewarp(false)` releases the dewarp networks, and `with_dewarp(true)` loads both files. See the [MonkeyOCRv2 guide](../oar-ocr-vl/README.md#monkeyocrv2-sb-parsing) for the default page API, budgets and standalone rectification.
 
 ### Downloading the Model
 
@@ -471,7 +670,7 @@ hf download zenosai/MonkeyOCRv2-S-Parsing --local-dir MonkeyOCRv2-S-Parsing
 hf download zenosai/MonkeyOCRv2-B-Parsing --local-dir MonkeyOCRv2-B-Parsing
 ```
 
-### Basic Usage
+### Explicit Task Generation
 
 ```rust,no_run
 use oar_ocr_vl::utils::image::load_image;
@@ -506,7 +705,7 @@ cargo run -p oar-ocr-vl --features cuda --example monkeyocrv2 -- \
     document.jpg
 ```
 
-The other `--task` values are `layout`, `text`, `formula`, and `table`. The model also implements `RecognitionBackend` for external-layout crop recognition, although its native tasks are the preferred full-page path.
+The other `--task` values are `layout`, `text`, `formula`, and `table`. `RecognitionBackend` routes external crops to text, formula or table recognition. Use `PageParser` for the default two-stage page pipeline.
 
 The same API and example accept `MonkeyOCRv2-B-Parsing`; select it by changing `--model-dir` to that checkpoint directory.
 
@@ -581,7 +780,11 @@ cargo run -p oar-ocr-vl --features cuda --example hunyuanocr -- \
     document.jpg
 ```
 
-### Application-oriented Prompts
+### Prompts and Joint Requests
+
+`PageParser` selects the loaded version's official document prompt when `HunyuanOcrParseOptions::prompt` is empty. Version 1.5 uses the official Chinese task prompts and an empty system turn; region OCR requests plain text. Explicit `generate` calls use the supplied instructions. See the [HunyuanOCR guide](../oar-ocr-vl/README.md#hunyuanocr-15-direct-inference) for prompts and defaults.
+
+`HunyuanOcr::generate_joint` generates one response from several images with version 1.5. The batch API answers each image separately; see the [joint-generation guide](../oar-ocr-vl/README.md#unified-page-parsing).
 
 Prompts from the upstream HunyuanOCR README:
 
@@ -595,6 +798,8 @@ Prompts from the upstream HunyuanOCR README:
 ## GLM-OCR
 
 [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) is an OCR expert VLM in the `oar-ocr-vl` crate. It uses prompt-driven image-to-text generation and can be used directly or as a `DocParser` backend.
+
+Generation defaults to the SDK's repetition penalty of 1.1 over prompt and generated tokens. `GlmOcr::with_repetition_penalty` sets the penalty; see the [GLM-OCR guide](../oar-ocr-vl/README.md#glm-ocr-direct-inference) for generation and region-processing defaults.
 
 ### Downloading the Model
 
@@ -741,9 +946,13 @@ cargo run -p oar-ocr-vl --features cuda \
 
 ## DocParser
 
-DocParser provides a unified API for external layout-first document parsing with VL-based recognition. PaddleOCR-VL, GLM-OCR, MonkeyOCRv2, OvisOCR2, HunyuanOCR, MinerU2.5/Pro, and MinerU-Diffusion implement `RecognitionBackend`. The `doc_parser` CLI example exposes the PaddleOCR-VL and GLM-OCR paths; use the other backends through the library API. HPD-Parsing currently supports only its model-native full-page protocol.
+`DocParser` combines any `LayoutSource` with a `RecognitionBackend` for layout-first document parsing. `PpDocLayout` supplies native Candle layout detection, and `LayoutPageParser` exposes the composition through `PageParser`. Backend reading-order predictions can reorder detected regions before crop recognition; OXR uses this path by default.
 
-Use `parse(&layout, image)` with any `LayoutSource` — `PpDocLayout` is the built-in one and runs on Candle, so no ONNX Runtime is involved. Regions are recognized in layout order and may be grouped into bounded recognition batches. For complete pages, prefer the model-native paths for MonkeyOCRv2, OvisOCR2, HPD-Parsing, HunyuanOCR, and the MinerU family. Except for HPD-Parsing, their `RecognitionBackend` implementations are intended for externally detected crops.
+Settings resolve from the backend's `DocParserProfile`, then an explicitly supplied `DocParserConfig`, then `DocParserOptions`. Per-call options override parser options. Custom backends use the default profile; use `with_options` for individual overrides.
+
+Profiles select token budgets, crop merging, label actions, error handling and Markdown styles. `LayoutPostprocessOptions` controls NMS, containment and mask geometry. A `PagePreprocessor` transforms each page once before layout; region boxes refer to that prepared canvas.
+
+Use `parser.render_markdown(&result)` for the selected profile's formatting. See the [crate guide](../oar-ocr-vl/README.md#docparser) for configuration and API examples, and the [runnable DocParser example](../oar-ocr-vl/examples/doc_parser.rs) for CLI usage.
 
 ### Basic Usage
 
@@ -843,9 +1052,7 @@ let config = OrtSessionConfig::new()
     .with_inter_threads(2);
 ```
 
-Thread-count tuning is workload and CPU dependent. The OCR example exposes the
-relevant controls so Windows users can measure several values without changing
-code:
+Thread-count tuning is workload and CPU dependent. The OCR example exposes the relevant controls so Windows users can measure several values without changing code:
 
 ```powershell
 cargo run --release --example ocr -- --intra-threads 8 <OPTIONS> <IMAGES>...
@@ -853,8 +1060,7 @@ cargo run --release --example ocr -- --intra-threads 12 <OPTIONS> <IMAGES>...
 cargo run --release --example ocr -- --intra-threads 16 <OPTIONS> <IMAGES>...
 ```
 
-Pipelines with several ONNX models can share one process-wide worker pool instead
-of creating a pool for every session. Commit it before building any predictor:
+Pipelines with several ONNX models can share one process-wide worker pool instead of creating a pool for every session. Commit it before building any predictor:
 
 ```rust
 use oar_ocr::core::OrtGlobalThreadPoolOptions;
@@ -866,30 +1072,21 @@ OrtGlobalThreadPoolOptions::new()
 // Build OAROCR/OARStructure only after the global environment is committed.
 ```
 
-The `ocr` and `structure` examples expose this as `--global-thread-pool`. Do not
-also set session-local thread counts when a global pool is active. Sharing mainly
-reduces worker creation and contention in multi-model pipelines; benchmark it for
-your workload rather than assuming it lowers single-request latency. See ONNX
-Runtime's [thread management guide](https://onnxruntime.ai/docs/performance/tune-performance/threading.html)
-for the underlying process-wide pool behavior.
+The `ocr` and `structure` examples expose this as `--global-thread-pool`. Do not also set session-local thread counts when a global pool is active. Sharing mainly reduces worker creation and contention in multi-model pipelines; benchmark it for your workload rather than assuming it lowers single-request latency. See ONNX Runtime's [thread management guide](https://onnxruntime.ai/docs/performance/tune-performance/threading.html) for the underlying process-wide pool behavior.
 
-On Windows, examples built with `--features directml` also accept
-`--device directml`, `--device directml:N`, and the shorter `--device dml:N`.
-The selected DirectML provider keeps the accelerator-oriented batch defaults.
+On Windows, examples built with `--features directml` also accept `--device directml`, `--device directml:N`, and the shorter `--device dml:N`. The selected DirectML provider keeps the accelerator-oriented batch defaults.
+
+### ONNX Runtime logging
+
+OAR defaults ONNX Runtime's global logging to Error only when it initializes the environment itself; an environment configured by the application is preserved. Explicit session logging requests lower an OAR-owned environment's threshold to the lowest requested severity; subsequent sessions do not raise it again. To see ORT warnings, call `ort::init().commit()` and set `ort::environment::Environment::current()?.set_log_level(ort::logging::LogLevel::Warning)` before constructing any OAR model.
 
 ### Device-aware batching
 
-The high-level OCR and Structure builders choose different defaults for CPU and
-accelerator execution. CPU operators already parallelize through ONNX Runtime's
-intra-op pool, so outer image batches default to `1` and text-recognition batches
-default to `4`, except PP-OCRv6 Tiny recognition uses `16` to better amortize its
-much smaller per-item workload. Explicitly configured accelerators retain the
-larger adapter defaults (`8` images for OCR detection, `4` pages for layout
-detection, and `64` text regions for recognition).
+The high-level OCR and Structure builders choose different defaults for CPU and accelerator execution. CPU operators already parallelize through ONNX Runtime's intra-op pool, so outer image batches default to `1` and text-recognition batches default to `4`, except PP-OCRv6 Tiny recognition uses `16` to better amortize its much smaller per-item workload. Explicitly configured accelerators retain the larger adapter defaults (`8` images for OCR detection, `4` pages for layout detection, and `64` text regions for recognition).
 
-Explicit `.image_batch_size(...)` and `.region_batch_size(...)` values always
-take precedence. Model size and CPU topology still matter, so applications with
-fixed workloads should benchmark nearby values.
+Explicit `.image_batch_size(...)` and `.region_batch_size(...)` values always take precedence. Model size and CPU topology still matter, so applications with fixed workloads should benchmark nearby values.
+
+For a 4 GiB GPU, add `.gpu_memory_budget(4 * 1024 * 1024 * 1024)` to either OCR or Structure builder after selecting an accelerator. With whole GiB `g`, image batches use `clamp(2*g - 6, 1, 8)` and recognition uses `clamp(12*g - 28, 4, 64)`: 4 GiB gives 2/20, and 8 GiB or more gives 8/64. Explicit batch sizes still win. CUDA arenas are limited to half the budget per session, default to `SameAsRequested`, and release idle memory; existing smaller arena limits and explicit arena settings are retained. The budget is a tuning hint, not measured free VRAM or a device-wide memory cap: resident models, concurrent pipelines, and non-arena allocations can exceed it. DirectML gets the conservative batches but cannot use CUDA's arena controls.
 
 ### Task-Specific Configs
 

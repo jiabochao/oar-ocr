@@ -37,15 +37,21 @@ pub struct CRNNModel {
     resizer: OCRResize,
     /// CTC decoder for postprocessing
     decoder: CTCLabelDecode,
+    #[cfg(feature = "cuda")]
+    cuda_reducer: super::ctc_cuda::CtcReducer,
 }
 
 impl CRNNModel {
     /// Creates a new CRNN model.
     pub fn new(inference: OrtInfer, resizer: OCRResize, decoder: CTCLabelDecode) -> Self {
+        #[cfg(feature = "cuda")]
+        let cuda_reducer = super::ctc_cuda::CtcReducer::new(&inference);
         Self {
             inference,
             resizer,
             decoder,
+            #[cfg(feature = "cuda")]
+            cuda_reducer,
         }
     }
 
@@ -262,11 +268,31 @@ impl CRNNModel {
 
         // Reduce straight from ONNX Runtime's output buffer. Building an owned
         // `Array3` here would force a multi-hundred-MB (often multi-GB) copy of
-        // the `(batch, time, vocab)` logits per call. Only argmax must run while
-        // that borrowed buffer (and therefore the session lock) is alive; CTC
-        // collapse and string construction happen after this call returns.
+        // the `(batch, time, vocab)` logits per call. The callback retains the
+        // ORT buffer without holding the session lock; CTC collapse and string
+        // construction happen after this call returns.
         let input_name = self.inference.input_name();
         let inputs = vec![(input_name, TensorInput::Array4(&batch_tensor))];
+        #[cfg(feature = "cuda")]
+        if self
+            .cuda_reducer
+            .allows(batch_tensor.shape()[0], batch_tensor.shape()[3])
+            && let Some(predictions) = self.inference.infer_cuda_output(&inputs)?
+        {
+            let reduced = self.cuda_reducer.reduce(
+                &predictions,
+                self.inference.cuda_device.expect("bound CUDA output"),
+            );
+            // Free bound logits before a possible CPU-output rerun.
+            drop(predictions);
+            match reduced {
+                Ok(Some(output)) => return Ok(self.postprocess_argmax(&output, return_positions)),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "CUDA CTC reduction failed; rerunning with CPU output")
+                }
+            }
+        }
         let output = self
             .inference
             .infer_first_output_f32(&inputs, |shape, data| {

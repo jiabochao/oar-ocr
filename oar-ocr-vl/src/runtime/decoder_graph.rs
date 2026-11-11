@@ -23,6 +23,315 @@ pub(crate) fn decoder_cache_capacity(
     Some(required.max(1).next_power_of_two().min(limit))
 }
 
+/// Inputs a decoder graph captures, named and typed. Shared by the
+/// decode-shaped captures; graphs with different shapes (draft heads,
+/// auxiliary taps) define their own bundle with equally concrete fields.
+#[cfg(feature = "cuda")]
+pub(crate) struct CudaGraphInputs {
+    pub(crate) hidden: Tensor,
+    pub(crate) positions: Tensor,
+    pub(crate) query_lengths: Tensor,
+    pub(crate) kv_lengths: CudaGraphKvLengths,
+    /// The LM head read inside the captured region; the graph holds this
+    /// clone so the body never needs an outer borrow.
+    pub(crate) lm_head: candle_nn::Linear,
+}
+
+/// Field-wise teardown for a graph's input bundle.
+///
+/// Dropping the bundle whole would let one field's destructor stash a CUDA
+/// error that the next field's destructor overwrites before either is
+/// drained. `dispose` releases each field separately, draining the context
+/// after every drop, matching the per-field teardown the handwritten
+/// graph structs did inline.
+#[cfg(feature = "cuda")]
+pub(crate) trait DecoderGraphInputs {
+    fn dispose(self, device: &Device);
+}
+
+#[cfg(feature = "cuda")]
+impl DecoderGraphInputs for CudaGraphInputs {
+    fn dispose(self, device: &Device) {
+        let Self {
+            hidden,
+            positions,
+            query_lengths,
+            kv_lengths,
+            lm_head,
+        } = self;
+        drop_and_drain(kv_lengths, device);
+        drop_and_drain(query_lengths, device);
+        drop_and_drain(positions, device);
+        drop_and_drain(hidden, device);
+        drop_and_drain(lm_head, device);
+    }
+}
+
+/// A captured decoder graph over a model-defined input bundle `I`.
+///
+/// Owning `inputs` retains every tensor the bundle holds for the graph's
+/// whole lifetime; the capture body is a bare `fn` pointer, so nothing
+/// outside the model (whose weights it owns) and the bundle can reach the
+/// captured region.
+#[cfg(feature = "cuda")]
+pub(crate) struct DecoderCudaGraph<I> {
+    pub(crate) graph: candle_core::cuda_backend::cudarc::driver::CudaGraph,
+    pub(crate) inputs: I,
+    pub(crate) outputs: Vec<Tensor>,
+    pub(crate) device: Device,
+    pub(crate) cache_len: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl<I: DecoderGraphInputs> DecoderCudaGraph<I> {
+    pub(crate) fn dispose(self) {
+        let Self {
+            graph,
+            inputs,
+            outputs,
+            device,
+            cache_len: _,
+        } = self;
+        report_stashed_cuda_error(&device, "decoder CUDA graph disposal");
+        drop_and_drain(graph, &device);
+        for tensor in outputs {
+            drop_and_drain(tensor, &device);
+        }
+        // The bundle tears itself down field by field, draining after each
+        // drop, so one field's stashed error cannot overwrite another's.
+        inputs.dispose(&device);
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl<I> std::fmt::Debug for DecoderCudaGraph<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecoderCudaGraph")
+            .field("cache_len", &self.cache_len)
+            .field("outputs", &self.outputs.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Per-batch row geometry for a batched decode step: the device write
+/// offsets for this step and the left-padding lengths that bound each
+/// row's live span. Both are rewritten on the device before every graph
+/// replay, so a reused graph never sees a previous batch's rows.
+#[cfg(feature = "cuda")]
+pub(crate) struct BatchDecodeRows<'a> {
+    pub(crate) row_starts: &'a [u32],
+    pub(crate) pad_lens: &'a [u32],
+}
+
+/// Capture a decoder graph.
+///
+/// `body` computes this step's outputs from the registered inputs; it must
+/// be a function item (no closures) so the captured region can only read
+/// model-owned state and the input bundle. The helper runs the warmup,
+/// allocates and primes one output buffer per returned tensor, captures,
+/// launches and synchronizes the warm launch, and assembles the graph.
+#[cfg(feature = "cuda")]
+pub(crate) fn capture_decoder_graph<M, I: DecoderGraphInputs>(
+    device: &Device,
+    model_name: &'static str,
+    model: &M,
+    inputs: I,
+    body: fn(&M, &I) -> Result<Vec<Tensor>, Error>,
+    cache_len: usize,
+) -> Result<DecoderCudaGraph<I>, Error> {
+    use candle_core::cuda_backend::cudarc::driver::sys::{
+        CUgraphInstantiate_flags_enum, CUstreamCaptureMode_enum,
+    };
+
+    let Device::Cuda(cuda) = device else {
+        return Err(Error::Config {
+            message: format!("{model_name} decoder graphs require a CUDA device"),
+        });
+    };
+    let stream = cuda.cuda_stream();
+    let _htod_cache = cuda.enable_cuda_graph_htod_cache();
+
+    // Every error path from here on releases the output buffers and the
+    // input bundle through the drain path rather than a plain drop: once a
+    // buffer has been referenced by a capture, a plain drop can stash
+    // CUDA_ERROR_INVALID_VALUE on the context, and the caller's state
+    // rollback or eager fallback would read that stale error. The warmup
+    // stage (before begin_capture) does not reference anything in a graph,
+    // but takes the same path for uniformity.
+    let mut outputs: Vec<Tensor> = Vec::new();
+    macro_rules! bail_drained {
+        ($error:expr) => {{
+            for output in outputs.drain(..) {
+                drop_and_drain(output, device);
+            }
+            // The bundle tears itself down field by field, draining after
+            // each drop.
+            inputs.dispose(device);
+            return Err($error);
+        }};
+    }
+
+    let warm_outputs = match body(model, &inputs) {
+        Ok(warm_outputs) => warm_outputs,
+        Err(error) => bail_drained!(error),
+    };
+    let mut synced = Vec::with_capacity(warm_outputs.len());
+    for (index, output) in warm_outputs.iter().enumerate() {
+        if let Err(error) = sync_graph_tensor(
+            model_name,
+            output,
+            output_context(index, "warm decoder CUDA graph"),
+        ) {
+            bail_drained!(error);
+        }
+        synced.push(output.clone());
+    }
+    // Allocate the output buffers before capture so they belong to the
+    // regular stream-ordered pool; a capture-time allocation lives in the
+    // graph's private pool and can never be returned to the allocator
+    // safely. Prime the copies so the captured run sees warm kernels.
+    outputs = match synced
+        .iter()
+        .map(|warm| {
+            warm.zeros_like()
+                .map_err(|e| candle_to_ocr_inference(model_name, "graph output buffer", e))
+        })
+        .collect::<Result<Vec<Tensor>, Error>>()
+    {
+        Ok(buffers) => buffers,
+        Err(error) => bail_drained!(error),
+    };
+    for (buffer, warm) in outputs.iter().zip(&synced) {
+        if let Err(error) = buffer
+            .slice_set(warm, 0, 0)
+            .map_err(|e| candle_to_ocr_inference(model_name, "prime graph output copy", e))
+        {
+            bail_drained!(error);
+        }
+    }
+
+    // Thread-local mode: only this thread's unsafe calls (allocations,
+    // synchronization) can invalidate the capture. Global mode would let
+    // another parser replica's allocation on a different thread abort it.
+    if let Err(error) = stream
+        .begin_capture(CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+        .map_err(|e| cuda_graph_error(model_name, "begin decoder CUDA graph capture", e))
+    {
+        bail_drained!(error);
+    }
+    let captured_output: Result<(), Error> = (|| {
+        let produced = body(model, &inputs)?;
+        if produced.len() != outputs.len() {
+            return Err(Error::Config {
+                message: format!(
+                    "{model_name} capture produced {} outputs after {} in warmup",
+                    produced.len(),
+                    outputs.len()
+                ),
+            });
+        }
+        for (buffer, value) in outputs.iter().zip(&produced) {
+            buffer
+                .slice_set(value, 0, 0)
+                .map_err(|e| candle_to_ocr_inference(model_name, "record graph output copy", e))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = captured_output {
+        // end_capture may still hand back an instantiated graph even though
+        // the body failed; a plain drop of it can poison the context, so
+        // release it through the drain path like every other teardown.
+        if let Ok(Some(graph)) = stream.end_capture(
+            CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        ) {
+            drop_and_drain(graph, device);
+        }
+        bail_drained!(error);
+    }
+    let graph = match stream
+        .end_capture(CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+    {
+        Ok(Some(graph)) => graph,
+        Ok(None) => bail_drained!(Error::Config {
+            message: format!("{model_name} decoder capture returned no graph"),
+        }),
+        Err(error) => {
+            bail_drained!(cuda_graph_error(
+                model_name,
+                "end decoder CUDA graph capture",
+                error
+            ));
+        }
+    };
+    if let Err(error) = graph
+        .launch()
+        .map_err(|e| cuda_graph_error(model_name, "warm decoder CUDA graph", e))
+    {
+        // The instantiated graph is itself graph-bound state: drain after
+        // dropping it before releasing the buffers it referenced.
+        drop_and_drain(graph, device);
+        bail_drained!(error);
+    }
+    for (index, buffer) in outputs.iter().enumerate() {
+        if let Err(error) = sync_graph_tensor(
+            model_name,
+            buffer,
+            output_context(index, "sync decoder CUDA graph"),
+        ) {
+            drop_and_drain(graph, device);
+            bail_drained!(error);
+        }
+    }
+    Ok(DecoderCudaGraph {
+        graph,
+        inputs,
+        outputs,
+        device: Device::Cuda(cuda.clone()),
+        cache_len,
+    })
+}
+
+/// Static context labels for graph output synchronization.
+#[cfg(feature = "cuda")]
+fn output_context(index: usize, stage: &'static str) -> &'static str {
+    match (stage, index) {
+        ("warm decoder CUDA graph", 0) => "warm decoder CUDA graph output 0",
+        ("warm decoder CUDA graph", 1) => "warm decoder CUDA graph output 1",
+        ("warm decoder CUDA graph", 2) => "warm decoder CUDA graph output 2",
+        ("sync decoder CUDA graph", 0) => "sync decoder CUDA graph output 0",
+        ("sync decoder CUDA graph", 1) => "sync decoder CUDA graph output 1",
+        ("sync decoder CUDA graph", 2) => "sync decoder CUDA graph output 2",
+        _ => "decoder CUDA graph output",
+    }
+}
+
+/// Initial decode bucket for a prompt under the growth ladder: the next
+/// power of two covering the prompt plus one decode step. Capturing just
+/// past the prompt keeps the graph's masked attention proportional to what
+/// the generation actually needs; replay doubles the bucket when the
+/// sequence outgrows it. `None` keeps prompts at or over `limit` on the
+/// eager path entirely — their KV can never fit a bucket.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn prompt_decode_bucket(prompt_len: usize, limit: usize) -> Option<usize> {
+    if prompt_len >= limit || limit == 0 {
+        return None;
+    }
+    Some(prompt_len.saturating_add(1).next_power_of_two().min(limit))
+}
+
+/// Bucket the ladder grows to once a generation reaches the end of
+/// `cache_len`: fourfold, capped at the graph's `ceiling`. One jump to the
+/// ceiling keeps the re-capture and KV-copy cost of a climb to a single
+/// step; `None` means the ladder is at its ceiling and an overflowing
+/// generation falls back to eager.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn next_decode_bucket(cache_len: usize, ceiling: usize) -> Option<usize> {
+    if cache_len == 0 || cache_len >= ceiling {
+        return None;
+    }
+    Some(cache_len.saturating_mul(4).min(ceiling))
+}
+
 /// Match eager decoder attention: a single query has no future token to mask,
 /// while verification blocks must remain causal within the block.
 #[cfg(any(feature = "cuda", test))]
@@ -155,6 +464,90 @@ struct CopyPinnedKvLengths<'a> {
     source: &'a candle_core::cuda_backend::cudarc::driver::PinnedHostSlice<u32>,
 }
 
+/// Per-row u32 device values for a batched decode graph: one u32 per row,
+/// refreshed from pinned memory before each replay. Backs both the row
+/// write offsets and the per-row padding bounds — any batch-dependent value
+/// the captured graph reads must live here so replays see the current batch.
+#[cfg(feature = "cuda")]
+pub(crate) struct CudaGraphPerRowU32 {
+    tensor: Tensor,
+    host: RefCell<candle_core::cuda_backend::cudarc::driver::PinnedHostSlice<u32>>,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaGraphPerRowU32 {
+    /// `shape` fixes how the graph broadcasts the row values: row starts
+    /// use one flat slot per row, pad bounds broadcast against a rank-4
+    /// attention mask.
+    pub(crate) fn new(shape: &[usize], device: &Device) -> candle_core::Result<Self> {
+        use candle_core::cuda_backend::WrapErr;
+
+        let Device::Cuda(cuda) = device else {
+            candle_core::bail!("CUDA-graph per-row values require a CUDA device")
+        };
+        let len = shape.iter().try_fold(1usize, |acc, &dim| {
+            acc.checked_mul(dim)
+                .ok_or_else(|| candle_core::Error::Msg("per-row shape overflows".to_string()))
+        })?;
+        let values = vec![0u32; len];
+        let tensor = Tensor::new(values.as_slice(), device)?.reshape(shape)?;
+        let stream = cuda.cuda_stream();
+        // SAFETY: the slice is initialized immediately below before the
+        // page-locked allocation can be read or copied.
+        let mut host = unsafe { stream.context().alloc_pinned::<u32>(len) }.w()?;
+        let host_ptr = host.as_mut_ptr().w()?;
+        // SAFETY: `host` owns `len` properly aligned u32 slots.
+        unsafe {
+            for (slot, value) in
+                std::iter::zip(std::slice::from_raw_parts_mut(host_ptr, len), &values)
+            {
+                *slot = *value;
+            }
+        }
+        Ok(Self {
+            tensor,
+            host: RefCell::new(host),
+        })
+    }
+
+    pub(crate) fn tensor(&self) -> &Tensor {
+        &self.tensor
+    }
+
+    pub(crate) fn update(&self, values: &[u32]) -> candle_core::Result<()> {
+        use candle_core::cuda_backend::WrapErr;
+
+        if values.len() != self.tensor.elem_count() {
+            candle_core::bail!(
+                "CUDA-graph per-row values need {} entries, got {}",
+                self.tensor.elem_count(),
+                values.len()
+            );
+        }
+        let mut host = self.host.borrow_mut();
+        let host_ptr = host.as_mut_ptr().w()?;
+        // SAFETY: waiting in `as_mut_ptr` makes the previous asynchronous
+        // copy safe to overwrite; the slice spans exactly the owned slots.
+        unsafe {
+            for (slot, value) in std::iter::zip(
+                std::slice::from_raw_parts_mut(host_ptr, values.len()),
+                values,
+            ) {
+                *slot = *value;
+            }
+        }
+        self.tensor
+            .inplace_op1(&CopyPinnedKvLengths { source: &host })
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for CudaGraphPerRowU32 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CudaGraphPerRowU32").finish_non_exhaustive()
+    }
+}
+
 #[cfg(feature = "cuda")]
 impl InplaceOp1 for CopyPinnedKvLengths<'_> {
     fn name(&self) -> &'static str {
@@ -173,8 +566,12 @@ impl InplaceOp1 for CopyPinnedKvLengths<'_> {
         let Some((start, end)) = layout.contiguous_offsets() else {
             candle_core::bail!("CUDA-graph KV lengths must be contiguous")
         };
-        if end.saturating_sub(start) != 2 {
-            candle_core::bail!("CUDA-graph KV lengths must contain two u32 values")
+        if end.saturating_sub(start) != self.source.len() {
+            candle_core::bail!(
+                "CUDA-graph KV lengths destination has {} slots for {} values",
+                end.saturating_sub(start),
+                self.source.len()
+            )
         }
         let device = storage.device.clone();
         let destination = storage.as_cuda_slice_mut::<u32>()?;
@@ -249,53 +646,12 @@ impl std::fmt::Debug for CudaGraphKvLengths {
 /// that stale CUDA_ERROR_INVALID_VALUE. `dispose` drops everything and then
 /// drains the stashed error so nothing leaks and no context state is kept
 /// alive by forgotten tensors.
-#[cfg(feature = "cuda")]
-pub(crate) struct SingleTokenDecoderCudaGraph {
-    pub(crate) graph: candle_core::cuda_backend::cudarc::driver::CudaGraph,
-    pub(crate) hidden_input: Tensor,
-    pub(crate) position_input: Tensor,
-    pub(crate) _query_lengths: Tensor,
-    pub(crate) kv_lengths: CudaGraphKvLengths,
-    pub(crate) logits_output: Tensor,
-    pub(crate) cache_len: usize,
-}
-
-#[cfg(feature = "cuda")]
-impl SingleTokenDecoderCudaGraph {
-    pub(crate) fn dispose(self) {
-        let Self {
-            graph,
-            hidden_input,
-            position_input,
-            _query_lengths,
-            kv_lengths,
-            logits_output,
-            cache_len: _,
-        } = self;
-        let device = hidden_input.device().clone();
-        report_stashed_cuda_error(&device, "decoder CUDA graph disposal");
-        drop_and_drain(graph, &device);
-        drop_and_drain(logits_output, &device);
-        drop_and_drain(kv_lengths, &device);
-        drop_and_drain(_query_lengths, &device);
-        drop_and_drain(position_input, &device);
-        drop_and_drain(hidden_input, &device);
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl std::fmt::Debug for SingleTokenDecoderCudaGraph {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SingleTokenDecoderCudaGraph")
-            .field("hidden", &self.hidden_input.shape())
-            .field("cache_len", &self.cache_len)
-            .finish_non_exhaustive()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{decoder_attention_is_causal, decoder_cache_capacity};
+    use super::{
+        decoder_attention_is_causal, decoder_cache_capacity, next_decode_bucket,
+        prompt_decode_bucket,
+    };
 
     #[test]
     fn cache_capacity_uses_bounded_power_of_two_buckets() {
@@ -306,6 +662,19 @@ mod tests {
         assert_eq!(decoder_cache_capacity(100, 0, LIMIT), None);
         assert_eq!(decoder_cache_capacity(LIMIT, 1, LIMIT), None);
         assert_eq!(decoder_cache_capacity(1, 1, 0), None);
+    }
+
+    #[test]
+    fn prompt_bucket_covers_the_prompt_and_the_ladder_doubles() {
+        const LIMIT: usize = 16_384;
+        assert_eq!(prompt_decode_bucket(1500, LIMIT), Some(2048));
+        assert_eq!(prompt_decode_bucket(2047, LIMIT), Some(2048));
+        assert_eq!(prompt_decode_bucket(2048, LIMIT), Some(4096));
+        assert_eq!(prompt_decode_bucket(LIMIT, LIMIT), None);
+        assert_eq!(prompt_decode_bucket(1, 0), None);
+        assert_eq!(next_decode_bucket(512, LIMIT), Some(2048));
+        assert_eq!(next_decode_bucket(8_192, 8_192), None);
+        assert_eq!(next_decode_bucket(0, LIMIT), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use super::config::PaddleOcrVlVisionConfig;
 use crate::error::Error;
-use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing, rotate_half};
+use crate::runtime::tensor::apply_rotary_f32;
+use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::Module;
 use rayon::prelude::*;
@@ -15,31 +16,6 @@ const ATTN_FULL_SEQ_THRESHOLD: usize = 8192;
 const ATTN_CHUNK_SIZE: usize = 512;
 /// Free-memory headroom for allocations after the softmax scratch peak.
 const ATTN_FREE_MEM_HEADROOM: usize = 256 * 1024 * 1024;
-
-/// [`ATTN_FULL_SEQ_THRESHOLD`], overridable via the
-/// `OAR_VL_ATTN_FULL_SEQ_THRESHOLD` env var (`0` forces chunked attention).
-fn attn_full_seq_threshold() -> usize {
-    static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *THRESHOLD.get_or_init(|| {
-        match std::env::var("OAR_VL_ATTN_FULL_SEQ_THRESHOLD") {
-            Ok(v) => match v.trim().parse() {
-                Ok(t) => {
-                    tracing::info!(
-                        "vision attention full-seq threshold {t} from OAR_VL_ATTN_FULL_SEQ_THRESHOLD"
-                    );
-                    t
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "ignoring invalid OAR_VL_ATTN_FULL_SEQ_THRESHOLD value '{v}' (expected an integer)"
-                    );
-                    ATTN_FULL_SEQ_THRESHOLD
-                }
-            },
-            Err(_) => ATTN_FULL_SEQ_THRESHOLD,
-        }
-    })
-}
 
 /// Peak transient bytes of the full-matrix path: the `[b, heads, seq, seq]`
 /// scores in the compute dtype, their F32 copy, the F32 softmax output, and
@@ -134,158 +110,6 @@ impl SigLIPRotaryEmbedding {
     }
 }
 
-fn rotate_half_vision(x: &Tensor) -> Result<Tensor, Error> {
-    rotate_half(x)
-}
-
-/// Apply rotary position embedding for vision (2D)
-fn apply_rotary_pos_emb_vision(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-) -> Result<(Tensor, Tensor), Error> {
-    // q, k: (batch, seq, num_heads, head_dim)
-    // cos, sin: (seq, head_dim) -> need to unsqueeze for broadcasting
-    let orig_dtype = q.dtype();
-
-    let q = q.to_dtype(DType::F32).map_err(|e| {
-        candle_to_ocr_processing(
-            crate::error::ProcessingStage::TensorOperation,
-            "PaddleOCR-VL: vision rope q cast failed",
-            e,
-        )
-    })?;
-    let k = k.to_dtype(DType::F32).map_err(|e| {
-        candle_to_ocr_processing(
-            crate::error::ProcessingStage::TensorOperation,
-            "PaddleOCR-VL: vision rope k cast failed",
-            e,
-        )
-    })?;
-
-    // cos, sin: (seq, head_dim) -> (1, seq, 1, head_dim)
-    let cos = cos
-        .unsqueeze(0)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision cos unsqueeze0 failed",
-                e,
-            )
-        })?
-        .unsqueeze(2)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision cos unsqueeze2 failed",
-                e,
-            )
-        })?
-        .to_dtype(DType::F32)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision cos cast failed",
-                e,
-            )
-        })?;
-
-    let sin = sin
-        .unsqueeze(0)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision sin unsqueeze0 failed",
-                e,
-            )
-        })?
-        .unsqueeze(2)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision sin unsqueeze2 failed",
-                e,
-            )
-        })?
-        .to_dtype(DType::F32)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision sin cast failed",
-                e,
-            )
-        })?;
-
-    // q_embed = q * cos + rotate_half(q) * sin
-    let q_rot = rotate_half_vision(&q)?;
-    let q_embed = q
-        .broadcast_mul(&cos)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision q*cos failed",
-                e,
-            )
-        })?
-        .broadcast_add(&q_rot.broadcast_mul(&sin).map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision rotate_half(q)*sin failed",
-                e,
-            )
-        })?)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision q rope add failed",
-                e,
-            )
-        })?;
-
-    let k_rot = rotate_half_vision(&k)?;
-    let k_embed = k
-        .broadcast_mul(&cos)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision k*cos failed",
-                e,
-            )
-        })?
-        .broadcast_add(&k_rot.broadcast_mul(&sin).map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision rotate_half(k)*sin failed",
-                e,
-            )
-        })?)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision k rope add failed",
-                e,
-            )
-        })?;
-
-    let q_embed = q_embed.to_dtype(orig_dtype).map_err(|e| {
-        candle_to_ocr_processing(
-            crate::error::ProcessingStage::TensorOperation,
-            "PaddleOCR-VL: vision q_embed cast back failed",
-            e,
-        )
-    })?;
-    let k_embed = k_embed.to_dtype(orig_dtype).map_err(|e| {
-        candle_to_ocr_processing(
-            crate::error::ProcessingStage::TensorOperation,
-            "PaddleOCR-VL: vision k_embed cast back failed",
-            e,
-        )
-    })?;
-
-    Ok((q_embed, k_embed))
-}
-
 #[derive(Debug, Clone)]
 struct VisionAttention {
     q_proj: candle_nn::Linear,
@@ -363,7 +187,15 @@ impl VisionAttention {
 
         // Apply rotary embeddings if provided
         let (q, k) = if let Some((cos, sin)) = rope_emb {
-            let (q_rot, k_rot) = apply_rotary_pos_emb_vision(&q, &k, cos, sin)?;
+            // (seq, head_dim) -> (1, seq, 1, head_dim)
+            let layout = |table: &Tensor| {
+                table
+                    .unsqueeze(0)
+                    .and_then(|table| table.unsqueeze(2))
+                    .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision rope layout", e))
+            };
+            let (q_rot, k_rot) =
+                apply_rotary_f32(&q, &k, &layout(cos)?, &layout(sin)?, "PaddleOCR-VL")?;
             (
                 q_rot
                     .transpose(1, 2)
@@ -403,12 +235,9 @@ impl VisionAttention {
 
         // Metal's fused SDPA supports head_dim 72 and replaces the materialized
         // `[b, heads, seq, seq]` scores and their F32 softmax with one dispatch.
-        // Metal-only: the eager path stays byte-stable for CUDA. Still gated on
-        // the threshold so `OAR_VL_ATTN_FULL_SEQ_THRESHOLD` keeps forcing the
-        // chunked path as documented, even though the fused kernel is the
-        // leanest of the three.
+        // Keep the same full-sequence threshold for fused Metal attention.
         if hidden_states.device().is_metal()
-            && seq <= attn_full_seq_threshold()
+            && seq <= ATTN_FULL_SEQ_THRESHOLD
             && let Some(fused) =
                 crate::attention::try_fused_sdpa(&q, &k, &v, None, self.scale, false)
                     .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "vision fused sdpa", e))?
@@ -435,7 +264,7 @@ impl VisionAttention {
         // small-VRAM GPUs (issue #147) and thrash the unified-memory working set
         // on small Macs (issue #177). The chunked fallback is numerically
         // equivalent (mirrors PyTorch SDPA's memory profile).
-        let attn_output = if seq <= attn_full_seq_threshold()
+        let attn_output = if seq <= ATTN_FULL_SEQ_THRESHOLD
             && eager_attn_fits(
                 hidden_states.device(),
                 eager_attn_scratch_bytes(b, self.num_heads, seq, q.dtype()),
@@ -796,8 +625,8 @@ impl VisionModel {
         let device = pixel_values.device();
 
         // Compute height/width position IDs for 2D rope
-        let mut height_position_ids: Vec<i64> = Vec::new();
-        let mut width_position_ids: Vec<i64> = Vec::new();
+        let mut height_position_ids: Vec<u32> = Vec::new();
+        let mut width_position_ids: Vec<u32> = Vec::new();
 
         for &(t, h, w) in image_grid_thw {
             let hw = (h * w) as u32;
@@ -805,8 +634,8 @@ impl VisionModel {
             for idx in 0..numel as u32 {
                 // height_id = patch_idx // w, width_id = patch_idx % w
                 let patch_idx = idx % hw;
-                height_position_ids.push((patch_idx / w as u32) as i64);
-                width_position_ids.push((patch_idx % w as u32) as i64);
+                height_position_ids.push(patch_idx / w as u32);
+                width_position_ids.push(patch_idx % w as u32);
             }
         }
 
@@ -821,88 +650,13 @@ impl VisionModel {
         // Compute freqs for all positions 0..max_grid_size
         let freqs = self.rotary_pos_emb.forward(max_grid_size, device)?;
 
-        // Gather freqs for height and width positions
-        let h_ids = Tensor::new(height_position_ids.clone(), device)
-            .map_err(|e| {
-                candle_to_ocr_processing(
-                    crate::error::ProcessingStage::TensorOperation,
-                    "PaddleOCR-VL: vision height_ids tensor failed",
-                    e,
-                )
-            })?
-            .to_dtype(DType::U32)
-            .map_err(|e| {
-                candle_to_ocr_processing(
-                    crate::error::ProcessingStage::TensorOperation,
-                    "PaddleOCR-VL: vision height_ids cast failed",
-                    e,
-                )
-            })?;
-
-        let w_ids = Tensor::new(width_position_ids, device)
-            .map_err(|e| {
-                candle_to_ocr_processing(
-                    crate::error::ProcessingStage::TensorOperation,
-                    "PaddleOCR-VL: vision width_ids tensor failed",
-                    e,
-                )
-            })?
-            .to_dtype(DType::U32)
-            .map_err(|e| {
-                candle_to_ocr_processing(
-                    crate::error::ProcessingStage::TensorOperation,
-                    "PaddleOCR-VL: vision width_ids cast failed",
-                    e,
-                )
-            })?;
-
-        // freqs_h = freqs[height_ids], freqs_w = freqs[width_ids]
-        let freqs_h = freqs.index_select(&h_ids, 0).map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision freqs_h gather failed",
-                e,
-            )
-        })?;
-        let freqs_w = freqs.index_select(&w_ids, 0).map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision freqs_w gather failed",
-                e,
-            )
-        })?;
-
-        // Concatenate to get (num_patches, head_dim/2) then repeat to get (num_patches, head_dim)
-        let rope_emb = Tensor::cat(&[&freqs_h, &freqs_w], 1).map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision rope_emb cat failed",
-                e,
-            )
-        })?;
-        // Repeat to double the dimension for full head_dim
-        let rope_emb = Tensor::cat(&[&rope_emb, &rope_emb], 1).map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision rope_emb repeat failed",
-                e,
-            )
-        })?;
-
-        let cos = rope_emb.cos().map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision rope cos failed",
-                e,
-            )
-        })?;
-        let sin = rope_emb.sin().map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "PaddleOCR-VL: vision rope sin failed",
-                e,
-            )
-        })?;
+        let (cos, sin) = crate::runtime::tensor::vision_rotary_cos_sin(
+            &freqs,
+            &height_position_ids,
+            &width_position_ids,
+            "PaddleOCR-VL",
+            device,
+        )?;
 
         let patch = self
             .embeddings

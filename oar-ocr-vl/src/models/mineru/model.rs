@@ -1,15 +1,17 @@
-use super::config::{MinerUConfig, MinerUImageProcessorConfig};
+use super::config::{MinerUConfig, QwenVlImageProcessorConfig};
 use super::processing::preprocess_images;
-use super::text::MinerUTextModel;
-use super::vision::MinerUVisionModel;
+use super::vision::Qwen2VlVisionModel;
 use crate::attention::{
     combine_masks, create_causal_mask, create_generation_mask_if_needed, create_left_padding_mask,
 };
+use crate::backbones::qwen2_vl::Qwen2VlTextModel;
 use crate::error::Error;
 #[cfg(feature = "cuda")]
 use crate::runtime::cuda::{ArgmaxFirstBf16, ArgmaxFirstF32, MaskTokenIds};
 #[cfg(feature = "cuda")]
 use crate::runtime::decoder_graph::CudaGraphDrainGuard;
+pub use crate::runtime::trace::GenerationTrace;
+use crate::runtime::trace::top3;
 use crate::structure::LayoutElementType;
 use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing};
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -78,13 +80,14 @@ impl MinerUTaskPrompt {
 }
 
 pub struct MinerU {
+    pub(super) image_analysis: bool,
     device: Device,
     dtype: DType,
     cfg: MinerUConfig,
-    image_cfg: MinerUImageProcessorConfig,
+    image_cfg: QwenVlImageProcessorConfig,
     tokenizer: Tokenizer,
-    text: MinerUTextModel,
-    vision: MinerUVisionModel,
+    text: Qwen2VlTextModel,
+    vision: Qwen2VlVisionModel,
     lm_head: Linear,
     image_token_id: u32,
     eos_token_ids: Vec<u32>,
@@ -135,6 +138,18 @@ struct MinerUGenerationConfig {
 }
 
 impl MinerU {
+    /// Set whether native page parsing recognizes eligible images and charts. Enabled by default.
+    pub fn with_image_analysis(mut self, enabled: bool) -> Self {
+        self.image_analysis = enabled;
+        self
+    }
+
+    /// Set whether to use CUDA graphs for decoding. Enabled by default.
+    pub fn with_cuda_graphs(mut self, enabled: bool) -> Self {
+        self.text.set_cuda_graphs(enabled);
+        self
+    }
+
     pub fn from_dir(model_dir: impl AsRef<Path>, device: Device) -> Result<Self, Error> {
         Self::from_dir_with_runtime(model_dir, crate::RuntimeConfig::new(device))
     }
@@ -147,7 +162,7 @@ impl MinerU {
         let model_dir = model_dir.as_ref();
         let cfg = MinerUConfig::from_path(model_dir.join("config.json"))?;
         let image_cfg =
-            MinerUImageProcessorConfig::from_path(model_dir.join("preprocessor_config.json"))?;
+            QwenVlImageProcessorConfig::from_path(model_dir.join("preprocessor_config.json"))?;
 
         if image_cfg.merge_size != cfg.vision_config.spatial_merge_size {
             return Err(Error::Config {
@@ -218,8 +233,8 @@ impl MinerU {
                 .map_err(|e| candle_to_ocr_inference("MinerU2.5", "load safetensors", e))?
         };
 
-        let text = MinerUTextModel::load(&cfg, vb.pp("model"))?;
-        let vision = MinerUVisionModel::load(&cfg.vision_config, vb.pp("visual"))?;
+        let text = Qwen2VlTextModel::load(&cfg.qwen2_vl_text_config()?, vb.pp("model"))?;
+        let vision = Qwen2VlVisionModel::load(&cfg.vision_config, vb.pp("visual"))?;
 
         let image_token_id = cfg.image_token_id;
         let mut eos_token_ids = vec![cfg.eos_token_id];
@@ -259,6 +274,7 @@ impl MinerU {
         #[cfg(feature = "cuda")]
         let _drain_guard = CudaGraphDrainGuard::new(&device);
         Ok(Self {
+            image_analysis: true,
             device,
             dtype,
             cfg,
@@ -280,7 +296,7 @@ impl MinerU {
             top_p,
             top_k,
             #[cfg(feature = "cuda")]
-            gpu_greedy_sampling: std::env::var_os("OAR_MINERU_DISABLE_GPU_SAMPLING").is_none(),
+            gpu_greedy_sampling: true,
             #[cfg(feature = "cuda")]
             _drain_guard,
         })
@@ -318,7 +334,7 @@ impl MinerU {
             });
         }
 
-        let results = self.generate_tokens_internal(images, instructions, max_new_tokens)?;
+        let results = self.generate_tokens_internal(images, instructions, max_new_tokens, None)?;
         Ok(results
             .into_iter()
             .map(|tokens| self.decode_generated_tokens(&tokens))
@@ -346,7 +362,30 @@ impl MinerU {
                 ),
             });
         }
-        self.generate_tokens_internal(images, instructions, max_new_tokens)
+        self.generate_tokens_internal(images, instructions, max_new_tokens, None)
+    }
+
+    /// Greedy generation of one image with per-step top-3 logits, for
+    /// numerical alignment against the upstream reference (see the
+    /// `mineru_alignment` test).
+    pub fn generate_traced(
+        &self,
+        image: &RgbImage,
+        instruction: &str,
+        max_new_tokens: usize,
+    ) -> Result<GenerationTrace, Error> {
+        let mut step_top = Vec::new();
+        let tokens = self
+            .generate_tokens_internal(
+                std::slice::from_ref(image),
+                &[instruction],
+                max_new_tokens,
+                Some(&mut step_top),
+            )?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        Ok(GenerationTrace { tokens, step_top })
     }
 
     fn generate_tokens_internal(
@@ -354,10 +393,17 @@ impl MinerU {
         images: &[RgbImage],
         instructions: &[impl AsRef<str>],
         max_new_tokens: usize,
+        mut step_top: Option<&mut Vec<[(u32, f32); 3]>>,
     ) -> Result<Vec<Vec<u32>>, Error> {
         let batch_size = images.len();
 
-        let image_inputs = preprocess_images(images, &self.image_cfg, &self.device, self.dtype)?;
+        let image_inputs = preprocess_images(
+            images,
+            &self.image_cfg,
+            &self.device,
+            self.dtype,
+            "MinerU2.5",
+        )?;
         let image_token_counts: Vec<usize> = image_inputs
             .image_grid_thw
             .iter()
@@ -568,6 +614,12 @@ impl MinerU {
         for step in 0..max_new_tokens {
             if finished.iter().all(|&f| f) {
                 break;
+            }
+            if let Some(step_top) = step_top.as_deref_mut() {
+                step_top.push(
+                    top3(&logits_list[0])
+                        .map_err(|e| candle_to_ocr_inference("MinerU2.5", "trace logits", e))?,
+                );
             }
             let sampling_params = self.sampling_params();
             let mut next_tokens: Vec<u32> = Vec::with_capacity(batch_size);

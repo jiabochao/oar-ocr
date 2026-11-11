@@ -1,11 +1,9 @@
 use super::config::{GlmOcrImageProcessorConfig, GlmOcrVisionConfig};
+use crate::backbones::qwen_vl_processing::{self, QwenVlImageProcessorConfig};
 use crate::error::Error;
-use crate::utils::{
-    candle_to_ocr_processing,
-    image::{image_to_chw, patchify_merge_grouped, pil_resample_to_filter_type},
-};
+use crate::utils::image::qwen_vl_resize;
 use candle_core::{DType, Device, Tensor};
-use image::{RgbImage, imageops::FilterType};
+use image::RgbImage;
 
 #[derive(Debug, Clone)]
 pub struct GlmOcrImageInputs {
@@ -40,13 +38,11 @@ fn smart_resize_glm(
     let mut width = width as f64;
     let factor_f = factor as f64;
 
-    if height < factor_f {
-        width = (width * factor_f / height).round();
-        height = factor_f;
-    }
-    if width < factor_f {
-        height = (height * factor_f / width).round();
-        width = factor_f;
+    // The reference scales both sides by one factor and truncates.
+    if height < factor_f || width < factor_f {
+        let scale = (factor_f / height).max(factor_f / width);
+        height = (height * scale).trunc();
+        width = (width * scale).trunc();
     }
 
     let max_dim = height.max(width);
@@ -60,9 +56,10 @@ fn smart_resize_glm(
         });
     }
 
-    let mut h_bar = (height / factor_f).round() * factor_f;
-    let mut w_bar = (width / factor_f).round() * factor_f;
-    let t_bar = (num_frames as f64 / temporal_factor as f64).round() * temporal_factor as f64;
+    let mut h_bar = (height / factor_f).round_ties_even() * factor_f;
+    let mut w_bar = (width / factor_f).round_ties_even() * factor_f;
+    let t_bar =
+        (num_frames as f64 / temporal_factor as f64).round_ties_even() * temporal_factor as f64;
 
     let volume = t_bar * h_bar * w_bar;
     if volume > max_pixels as f64 {
@@ -117,11 +114,6 @@ pub fn preprocess_image(
         });
     }
 
-    let resize_filter = cfg
-        .resample
-        .and_then(pil_resample_to_filter_type)
-        .unwrap_or(FilterType::CatmullRom);
-
     let (h, w) = (image.height(), image.width());
     let factor = (cfg.patch_size * cfg.merge_size) as u32;
     let (rh, rw) = if cfg.do_resize {
@@ -138,8 +130,10 @@ pub fn preprocess_image(
         (h, w)
     };
 
+    // GLM's processor resamples with Pillow's bicubic, like the Qwen
+    // family it derives from.
     let resized = if rh != h || rw != w {
-        image::imageops::resize(image, rw, rh, resize_filter)
+        qwen_vl_resize(image, rw, rh, cfg.resample)?
     } else {
         image.clone()
     };
@@ -152,85 +146,53 @@ pub fn preprocess_image(
         });
     }
 
-    let mean = if cfg.do_normalize {
-        cfg.image_mean.clone()
-    } else {
-        vec![0.0, 0.0, 0.0]
-    };
-    let std = if cfg.do_normalize {
-        cfg.image_std.clone()
-    } else {
-        vec![1.0, 1.0, 1.0]
-    };
-
-    let rescale_factor = if cfg.do_rescale {
-        Some(cfg.rescale_factor)
-    } else {
-        None
-    };
-
-    let chw = image_to_chw(&resized, &mean, &std, rescale_factor);
-
-    let channel = 3usize;
-    let height = rh as usize;
-    let width = rw as usize;
-    let patch_size = cfg.patch_size;
-    let merge_size = cfg.merge_size;
-    let temporal_patch = cfg.temporal_patch_size;
-
-    // For static images the single CHW frame is repeated `temporal_patch` times
-    // to fill the temporal dimension expected by the vision encoder.
-    let frames: Vec<&[f32]> = std::iter::repeat_n(chw.as_slice(), temporal_patch).collect();
-
-    let grid_t = frames.len() / temporal_patch;
-    let grid_h = height / patch_size;
-    let grid_w = width / patch_size;
-
-    if !grid_h.is_multiple_of(merge_size) || !grid_w.is_multiple_of(merge_size) {
-        return Err(Error::Config {
-            message: format!(
-                "GLM-OCR preprocess produced non-divisible grid: grid_h={grid_h}, grid_w={grid_w}, merge_size={merge_size}"
-            ),
-        });
-    }
-
-    let patch_dim = channel * temporal_patch * patch_size * patch_size;
-    let num_patches = grid_t * grid_h * grid_w;
-
-    let flat = patchify_merge_grouped(
-        &frames,
-        channel,
-        height,
-        width,
-        grid_t,
-        grid_h,
-        grid_w,
-        patch_size,
-        merge_size,
-        temporal_patch,
+    // The resize above is GLM-OCR's temporal-volume-aware variant; the
+    // normalize, temporal repetition, and patchify tail is the shared
+    // Qwen-VL processing.
+    let shared_cfg = QwenVlImageProcessorConfig::for_resized_frames(
+        cfg.patch_size,
+        cfg.temporal_patch_size,
+        cfg.merge_size,
+        cfg.image_mean.clone(),
+        cfg.image_std.clone(),
+        cfg.do_normalize,
+        cfg.do_rescale.then_some(cfg.rescale_factor),
     );
-
-    let num_image_tokens = num_patches / (merge_size * merge_size);
-    let pixel_values = Tensor::from_vec(flat, (num_patches, patch_dim), device)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "GLM-OCR: failed to create pixel_values tensor",
-                e,
-            )
-        })?
-        .to_dtype(dtype)
-        .map_err(|e| {
-            candle_to_ocr_processing(
-                crate::error::ProcessingStage::TensorOperation,
-                "GLM-OCR: failed to cast pixel_values dtype",
-                e,
-            )
-        })?;
+    let inputs = qwen_vl_processing::preprocess_resized_frames(
+        std::slice::from_ref(&resized),
+        &shared_cfg,
+        device,
+        dtype,
+        "GLM-OCR",
+    )?;
+    let grid_thw = inputs.image_grid_thw[0];
+    let num_image_tokens = (grid_thw.1 * grid_thw.2) / (cfg.merge_size * cfg.merge_size);
 
     Ok(GlmOcrImageInputs {
-        pixel_values,
-        grid_thw: (grid_t, grid_h, grid_w),
+        pixel_values: inputs.pixel_values,
+        grid_thw,
         num_image_tokens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::smart_resize_glm;
+
+    #[test]
+    fn smart_resize_matches_the_python_processor() {
+        // Glm46VImageProcessor values for the GLM-OCR bounds: a halfway
+        // rounding case and two short-side pre-scales.
+        for ((height, width), expected) in [
+            ((28, 238), (28, 224)),
+            ((10, 175), (28, 476)),
+            ((8, 9), (84, 84)),
+        ] {
+            assert_eq!(
+                smart_resize_glm(2, height, width, 2, 28, 12_544, 9_633_792).unwrap(),
+                expected,
+                "{height}x{width}"
+            );
+        }
+    }
 }

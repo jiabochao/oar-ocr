@@ -13,20 +13,35 @@
 //!   backbone)
 //! - `mineru_diffusion` - MinerU-Diffusion-V1 block-diffusion document OCR
 //!   (Qwen2-VL vision + SDAR decoder)
+//! - `minicpm_ocr` - MiniCPM-OCR 1.0 region recognition and PP-DocLayout
+//!   page parsing (SigLIP vision + Qwen3.5)
 //! - `monkeyocrv2` - MonkeyOCRv2-S/B-Parsing full-page and region parsing
-//! - `navidc_ocr` - NaviDC-OCR document parsing VLM (Qwen2.5-VL backbone
+//! - `jina_ocr` - jina-ocr-v1 end-to-end page-to-Markdown parser (SAM+CLIP
+//!   DeepEncoder over a DeepSeek-V2 MoE decoder)
+//! - `teleocr` - TeleOCR document parsing VLM (Qwen2.5-VL backbone
 //!   with a windowed vision tower)
 //! - `ovisocr2` - OvisOCR2 end-to-end page-to-Markdown parser (Qwen3.5)
+//! - `ovisocr3` - OvisOCR3 Markdown, structured-page, and region recognition (Qwen3.5)
+//! - `oxr` - SoMark OXR-1.0 region recognition and PP-DocLayout page parsing
+//! - `unlimited_ocr` - Unlimited-OCR-2 single- and multi-page parsing
+//!   (DeepEncoder + DeepSeek-V2 MoE with DASH block-sparse attention)
+//! - `wevisdoc` - WeVisDoc end-to-end page-to-Markdown parser (Qwen3-VL
+//!   backbone with DeepStack)
+//! - `xiaomi_ocr` - Xiaomi-OCR-0 end-to-end page-to-Markdown parser
+//!   (Qwen3.5, sharing its text tower with OvisOCR2)
+//! - `youtu_parsing_omni` - Youtu-Parsing-Omni image-to-JSON document parser
 //! - `doc_parser` - Unified document parsing with pluggable recognition backends
 //! - `pp_doclayout` - Native PP-DocLayoutV2/V3 layout detection and reading
 //!   order
 //! - `layout` - Backend-agnostic [`LayoutSource`] trait feeding `doc_parser`
-//! - `api` - Stable recognition, page parsing, generation, and runtime contracts
+//! - `api` - Stable recognition, page parsing, generation, and runtime
+//!   contracts, plus the model-agnostic [`AnyPageParser`]
 //! - `document` - Standalone VL page and structure types
 //! - `pipeline` - Layout-first and model-native parsing orchestration
 //! - `render` - Markdown, text, and table output normalization
 //! - `attention` - Compatibility path for shared runtime attention
 //!
+//! [`AnyPageParser`]: crate::AnyPageParser
 //! [`LayoutSource`]: layout::LayoutSource
 //!
 //! ## Candle only
@@ -67,23 +82,39 @@ pub mod glmocr;
 pub mod hpd_parsing;
 #[path = "models/hunyuanocr/mod.rs"]
 pub mod hunyuanocr;
+#[path = "models/jina_ocr/mod.rs"]
+pub mod jina_ocr;
 pub mod layout;
 #[path = "models/mineru/mod.rs"]
 pub mod mineru;
 #[path = "models/mineru_diffusion/mod.rs"]
 pub mod mineru_diffusion;
+#[path = "models/minicpm_ocr/mod.rs"]
+pub mod minicpm_ocr;
 #[path = "models/monkeyocrv2/mod.rs"]
 pub mod monkeyocrv2;
-#[path = "models/navidc_ocr/mod.rs"]
-pub mod navidc_ocr;
 #[path = "models/ovisocr2/mod.rs"]
 pub mod ovisocr2;
+#[path = "models/ovisocr3/mod.rs"]
+pub mod ovisocr3;
+#[path = "models/oxr/mod.rs"]
+pub mod oxr;
 #[path = "models/paddleocr_vl/mod.rs"]
 pub mod paddleocr_vl;
 #[path = "models/pp_doclayout/mod.rs"]
 pub mod pp_doclayout;
 pub mod structure;
+#[path = "models/teleocr/mod.rs"]
+pub mod teleocr;
+#[path = "models/unlimited_ocr/mod.rs"]
+pub mod unlimited_ocr;
 pub mod utils;
+#[path = "models/wevisdoc/mod.rs"]
+pub mod wevisdoc;
+#[path = "models/xiaomi_ocr/mod.rs"]
+pub mod xiaomi_ocr;
+#[path = "models/youtu_parsing_omni/mod.rs"]
+pub mod youtu_parsing_omni;
 
 // Backwards-compatible shared attention path.
 pub mod attention;
@@ -93,28 +124,54 @@ pub use paddleocr_vl::{
     PaddleOcrVl, PaddleOcrVlConfig, PaddleOcrVlImageProcessorConfig, PaddleOcrVlTask,
 };
 
-pub use glmocr::GlmOcr;
+pub use glmocr::{GlmOcr, GlmOcrLoadOptions};
 pub use hpd_parsing::{HpdGenerationConfig, HpdOutput, HpdParsing, HpdRuntimeStats};
 pub use hunyuanocr::{
     DFlashConfig, DFlashTargetConfig, HunyuanOcr, HunyuanOcrParseOptions, HunyuanOcrVersion,
 };
+pub use jina_ocr::{JinaOcr, JinaOcrLoadOptions, JinaOcrParseOptions};
 pub use mineru::{MinerU, MinerUParseOptions};
 pub use mineru_diffusion::{
     DiffusionGenerationConfig, MinerUDiffusion, MinerUDiffusionParseOptions,
 };
+pub use minicpm_ocr::{MiniCpmOcr, MiniCpmOcrGenerationOptions, MiniCpmOcrTask};
 pub use monkeyocrv2::{MonkeyOcrV2, MonkeyOcrV2ParseOptions, MonkeyOcrV2Task};
-pub use navidc_ocr::{NaviDcOcr, NaviDcTask};
 pub use ovisocr2::{OvisOcr2, OvisOcr2ParseOptions};
+pub use ovisocr3::{OvisOcr3, OvisOcr3ParseMode, OvisOcr3ParseOptions};
+pub use oxr::{Oxr, OxrGenerationOptions, OxrTask};
+pub use teleocr::{TeleOcr, TeleOcrTask};
+pub use unlimited_ocr::{
+    UnlimitedOcr, UnlimitedOcrGenerationOptions, UnlimitedOcrParseOptions, UnlimitedOcrViewMode,
+};
+pub use wevisdoc::{WeVisDoc, WeVisDocParseOptions};
+pub use xiaomi_ocr::{XiaomiOcr, XiaomiOcrParseOptions};
+pub use youtu_parsing_omni::{YoutuParsingOmni, YoutuParsingOmniParseOptions};
 
+pub use api::any_page_parser::{
+    AnyPageParser, AnyPageParserLoadOptions, AnyPageParserModel, AnyPageParserOptions,
+};
+#[cfg(feature = "auto-download")]
+pub use api::download::{
+    AnyPageParserPretrainedOptions, DEFAULT_LAYOUT_REPO, DownloadSource, download_snapshot,
+};
 pub use api::generation::GenerationOptions;
 pub use api::page_parser::PageParser;
 pub use api::recognition::{BackendCapabilities, RecognitionBackend, RecognitionTask};
 pub use api::runtime::{DTypePolicy, RuntimeConfig};
-pub use doc_parser::{DocParser, DocParserConfig};
-pub use document::page::{DocumentBlock, PageDocument, ParseDiagnostic};
+pub use doc_parser::{DocParser, DocParserConfig, DocParserOptions, DocParserProfile};
+pub use document::dpp::{DppBlockOptions, DppOptions, DppOutput, DppPageContext};
+pub use document::page::{DocumentBlock, DocumentOutput, PageDocument, ParseDiagnostic};
 pub use error::{BatchResult, Error, ProcessingStage, Result};
 pub use geometry::{BoundingBox, Point};
-pub use layout::{LayoutDetectionElement, LayoutDetections, LayoutSource, StaticLayout};
+pub use layout::{
+    ContainmentMode, ContainmentRule, LayoutDetectionElement, LayoutDetections,
+    LayoutPostprocessOptions, LayoutPrediction, LayoutShapeMode, LayoutSource, ScoreComparison,
+    StaticLayout,
+};
+#[allow(deprecated)]
 pub use pipeline::page_parser::LayoutFirstPageParser;
+pub use pipeline::page_parser::{LayoutPageParser, LayoutPageParserOptions};
+pub use pipeline::page_preprocessing::PagePreprocessor;
 pub use pp_doclayout::{PpDocLayout, PpDocLayoutVersion};
+pub use runtime::device::auto_device;
 pub use structure::{LayoutElement, LayoutElementType, StructureResult, TableResult, TableType};

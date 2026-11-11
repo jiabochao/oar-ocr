@@ -10,76 +10,19 @@ use crate::runtime::cuda::dynamic_kv::DynamicKvAppend;
 use crate::runtime::decoder_graph::decoder_cache_capacity;
 #[cfg(feature = "cuda")]
 use crate::runtime::decoder_graph::{
-    CudaGraphDrainGuard, CudaGraphKvLengths, SingleTokenDecoderCudaGraph, cuda_graph_error,
-    decoder_attention_is_causal, sync_graph_tensor,
+    CudaGraphDrainGuard, CudaGraphInputs, CudaGraphKvLengths, DecoderCudaGraph,
+    capture_decoder_graph, cuda_graph_error, decoder_attention_is_causal,
 };
-use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing, rotate_half};
+use crate::runtime::tensor::rope_native;
+use crate::utils::candle_to_ocr_inference;
 #[cfg(feature = "cuda")]
-use candle_core::{DType, Device};
+use candle_core::DType;
 use candle_core::{IndexOp, Tensor};
 use candle_nn::{Linear, Module};
 use std::cell::RefCell;
 
 #[cfg(feature = "cuda")]
 const PADDLE_DECODE_CACHE_LEN: usize = 16_384;
-
-fn apply_multimodal_rotary_pos_emb(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    mrope_section: &[usize],
-) -> Result<(Tensor, Tensor), Error> {
-    // MRoPE uses 3 position dimensions
-    let cos = select_rope_sections(cos, mrope_section, 3)?;
-    let sin = select_rope_sections(sin, mrope_section, 3)?;
-    let q_mul = q.broadcast_mul(&cos).map_err(|e| {
-        candle_to_ocr_processing(
-            crate::error::ProcessingStage::TensorOperation,
-            "PaddleOCR-VL: mrope q*cos failed",
-            e,
-        )
-    })?;
-    let q_half = rotate_half(q)?;
-    let q_half_mul = q_half.broadcast_mul(&sin).map_err(|e| {
-        candle_to_ocr_processing(
-            crate::error::ProcessingStage::TensorOperation,
-            "PaddleOCR-VL: mrope rotate_half(q)*sin failed",
-            e,
-        )
-    })?;
-    let q_rot = (&q_mul + &q_half_mul).map_err(|e| {
-        candle_to_ocr_processing(
-            crate::error::ProcessingStage::TensorOperation,
-            "PaddleOCR-VL: mrope apply on q failed",
-            e,
-        )
-    })?;
-
-    let k_mul = k.broadcast_mul(&cos).map_err(|e| {
-        candle_to_ocr_processing(
-            crate::error::ProcessingStage::TensorOperation,
-            "PaddleOCR-VL: mrope k*cos failed",
-            e,
-        )
-    })?;
-    let k_half = rotate_half(k)?;
-    let k_half_mul = k_half.broadcast_mul(&sin).map_err(|e| {
-        candle_to_ocr_processing(
-            crate::error::ProcessingStage::TensorOperation,
-            "PaddleOCR-VL: mrope rotate_half(k)*sin failed",
-            e,
-        )
-    })?;
-    let k_rot = (&k_mul + &k_half_mul).map_err(|e| {
-        candle_to_ocr_processing(
-            crate::error::ProcessingStage::TensorOperation,
-            "PaddleOCR-VL: mrope apply on k failed",
-            e,
-        )
-    })?;
-    Ok((q_rot, k_rot))
-}
 
 #[derive(Debug, Clone)]
 struct Ernie4_5Mlp {
@@ -148,7 +91,6 @@ struct Ernie4_5Attention {
     num_kv_groups: usize,
     head_dim: usize,
     scaling: f64,
-    mrope_section: Vec<usize>,
     kv_cache: RefCell<TrimmableKvCache>,
 }
 
@@ -210,7 +152,6 @@ impl Ernie4_5Attention {
             num_kv_groups: cfg.num_attention_heads / cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
             scaling: (cfg.head_dim as f64).powf(-0.5),
-            mrope_section: cfg.rope_scaling.mrope_section.clone(),
             kv_cache: RefCell::new(kv_cache),
         })
     }
@@ -252,7 +193,8 @@ impl Ernie4_5Attention {
             .transpose(1, 2)
             .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "attn v transpose", e))?;
 
-        let (q, k) = apply_multimodal_rotary_pos_emb(&q, &k, cos, sin, &self.mrope_section)?;
+        let q = rope_native(&q, cos, sin, "PaddleOCR-VL")?;
+        let k = rope_native(&k, cos, sin, "PaddleOCR-VL")?;
 
         let q = q
             .contiguous()
@@ -532,11 +474,14 @@ impl Ernie4_5DecoderLayer {
 #[derive(Debug)]
 pub struct Ernie4_5Model {
     #[cfg(feature = "cuda")]
-    decode_graph: RefCell<Option<SingleTokenDecoderCudaGraph>>,
+    cuda_graphs: bool,
+    #[cfg(feature = "cuda")]
+    decode_graph: RefCell<Option<DecoderCudaGraph<CudaGraphInputs>>>,
     embed_tokens: candle_nn::Embedding,
     layers: Vec<Ernie4_5DecoderLayer>,
     norm: candle_nn::RmsNorm,
     rotary: RotaryEmbedding,
+    mrope_section: Vec<usize>,
     // Must stay the last field: it drops last and drains CUDA errors the
     // other fields' frees may stash (see CudaGraphDrainGuard).
     #[cfg(feature = "cuda")]
@@ -544,6 +489,18 @@ pub struct Ernie4_5Model {
 }
 
 impl Ernie4_5Model {
+    pub(crate) fn set_cuda_graphs(&mut self, enabled: bool) {
+        #[cfg(feature = "cuda")]
+        {
+            self.cuda_graphs = enabled;
+            if !enabled {
+                self.invalidate_cuda_graph();
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = enabled;
+    }
+
     pub fn load(cfg: &PaddleOcrVlConfig, vb: candle_nn::VarBuilder) -> Result<Self, Error> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))
@@ -562,11 +519,14 @@ impl Ernie4_5Model {
         let _drain_guard = CudaGraphDrainGuard::new(vb.device());
         Ok(Self {
             #[cfg(feature = "cuda")]
+            cuda_graphs: true,
+            #[cfg(feature = "cuda")]
             decode_graph: RefCell::new(None),
             embed_tokens,
             layers,
             norm,
             rotary,
+            mrope_section: cfg.rope_scaling.mrope_section.clone(),
             #[cfg(feature = "cuda")]
             _drain_guard,
         })
@@ -587,6 +547,9 @@ impl Ernie4_5Model {
         let (cos, sin) = self
             .rotary
             .forward_multi_axis(position_ids, inputs_embeds.dtype())?;
+
+        let cos = select_rope_sections(&cos, &self.mrope_section, 3)?;
+        let sin = select_rope_sections(&sin, &self.mrope_section, 3)?;
 
         self.forward_prepared(inputs_embeds, &cos, &sin, causal_mask)
     }
@@ -643,6 +606,8 @@ impl Ernie4_5Model {
         let (cos, sin) = self
             .rotary
             .forward_multi_axis(position_ids, inputs_embeds.dtype())?;
+        let cos = select_rope_sections(&cos, &self.mrope_section, 3)?;
+        let sin = select_rope_sections(&sin, &self.mrope_section, 3)?;
         let mut hidden_states = inputs_embeds.clone();
         for layer in &self.layers {
             hidden_states =
@@ -659,9 +624,8 @@ impl Ernie4_5Model {
         max_new_tokens: usize,
         lm_head: &Linear,
     ) -> Result<(), Error> {
-        if std::env::var_os("OAR_VL_DISABLE_CUDA_GRAPH").is_some()
-            || std::env::var_os("OAR_PADDLEOCR_VL_DISABLE_CUDA_GRAPH").is_some()
-        {
+        #[cfg(feature = "cuda")]
+        if !self.cuda_graphs {
             #[cfg(feature = "cuda")]
             self.invalidate_cuda_graph();
             return Ok(());
@@ -701,16 +665,13 @@ impl Ernie4_5Model {
 
     #[cfg(feature = "cuda")]
     fn capture_cuda_graph(&self, cache_len: usize, lm_head: &Linear) -> Result<(), Error> {
-        use candle_core::cuda_backend::cudarc::driver::sys::{
-            CUgraphInstantiate_flags_enum, CUstreamCaptureMode_enum,
-        };
-
         if self.decode_graph.borrow().is_some() {
             return Ok(());
         }
-        let Device::Cuda(cuda) = self.embed_tokens.embeddings().device() else {
+        let device = self.embed_tokens.embeddings().device();
+        if !device.is_cuda() {
             return Ok(());
-        };
+        }
         let query_len = 1;
         for layer in &self.layers {
             layer
@@ -723,83 +684,46 @@ impl Ernie4_5Model {
             .dim(1)
             .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "graph hidden size", e))?;
         let device = self.embed_tokens.embeddings().device();
-        let hidden_input = Tensor::zeros(
-            (1, query_len, hidden_size),
-            self.embed_tokens.embeddings().dtype(),
-            device,
-        )
-        .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "graph hidden input", e))?;
-        let position_input = Tensor::zeros((3, 1, query_len), DType::I64, device)
-            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "graph position input", e))?;
-        let query_lengths = Tensor::new(&[0u32, query_len as u32], device)
-            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "graph query lengths", e))?;
-        let kv_lengths = CudaGraphKvLengths::new(query_len, device)
-            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "graph KV lengths", e))?;
-        let stream = cuda.cuda_stream();
-        let _htod_cache = cuda.enable_cuda_graph_htod_cache();
-
-        let warm = self.forward_dynamic(
-            &hidden_input,
-            &position_input,
-            &query_lengths,
-            kv_lengths.tensor(),
-        )?;
-        let warm_logits = self.project_logits(&warm, lm_head)?;
-        sync_graph_tensor("PaddleOCR-VL", &warm_logits, "warm decoder CUDA graph")?;
-        // Allocate the output buffer before capture so it belongs to the
-        // regular stream-ordered pool; a capture-time allocation lives in the
-        // graph's private pool and can never be returned to the allocator
-        // safely. Prime the copy so the captured run sees a warm kernel.
-        let logits_output = Tensor::zeros_like(&warm_logits)
-            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "graph logits output", e))?;
-        logits_output
-            .slice_set(&warm_logits, 0, 0)
-            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "prime graph logits copy", e))?;
-
-        stream
-            .begin_capture(CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_GLOBAL)
-            .map_err(|e| cuda_graph_error("PaddleOCR-VL", "begin decoder CUDA graph capture", e))?;
-        let captured_output: Result<(), Error> = (|| {
-            let hidden = self.forward_dynamic(
-                &hidden_input,
-                &position_input,
-                &query_lengths,
-                kv_lengths.tensor(),
-            )?;
-            let logits = self.project_logits(&hidden, lm_head)?;
-            logits_output
-                .slice_set(&logits, 0, 0)
-                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "record graph logits copy", e))
-        })();
-        if let Err(error) = captured_output {
-            let _ = stream.end_capture(
-                CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-            );
-            return Err(error);
-        }
-        let graph = stream
-            .end_capture(
-                CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        let inputs = CudaGraphInputs {
+            hidden: Tensor::zeros(
+                (1, query_len, hidden_size),
+                self.embed_tokens.embeddings().dtype(),
+                device,
             )
-            .map_err(|e| cuda_graph_error("PaddleOCR-VL", "end decoder CUDA graph capture", e))?
-            .ok_or_else(|| Error::Config {
-                message: "PaddleOCR-VL decoder capture returned no graph".to_string(),
-            })?;
-        graph
-            .launch()
-            .map_err(|e| cuda_graph_error("PaddleOCR-VL", "warm decoder CUDA graph", e))?;
-        sync_graph_tensor("PaddleOCR-VL", &logits_output, "sync decoder CUDA graph")?;
-        self.clear_kv_cache();
-        *self.decode_graph.borrow_mut() = Some(SingleTokenDecoderCudaGraph {
-            graph,
-            hidden_input,
-            position_input,
-            _query_lengths: query_lengths,
-            kv_lengths,
-            logits_output,
+            .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "graph hidden input", e))?,
+            positions: Tensor::zeros((3, 1, query_len), DType::I64, device)
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "graph position input", e))?,
+            query_lengths: Tensor::new(&[0u32, query_len as u32], device)
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "graph query lengths", e))?,
+            kv_lengths: CudaGraphKvLengths::new(query_len, device)
+                .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "graph KV lengths", e))?,
+            lm_head: lm_head.clone(),
+        };
+        let graph = capture_decoder_graph(
+            device,
+            "PaddleOCR-VL",
+            self,
+            inputs,
+            Self::decode_graph_body,
             cache_len,
-        });
+        )?;
+        self.clear_kv_cache();
+        *self.decode_graph.borrow_mut() = Some(graph);
         Ok(())
+    }
+
+    /// The captured decode step: a bare `fn` so the captured region can
+    /// only read model-owned weights and the registered inputs.
+    #[cfg(feature = "cuda")]
+    fn decode_graph_body(this: &Self, inputs: &CudaGraphInputs) -> Result<Vec<Tensor>, Error> {
+        let hidden = this.forward_dynamic(
+            &inputs.hidden,
+            &inputs.positions,
+            &inputs.query_lengths,
+            inputs.kv_lengths.tensor(),
+        )?;
+        let logits = this.project_logits(&hidden, &inputs.lm_head)?;
+        Ok(vec![logits])
     }
 
     #[cfg(feature = "cuda")]
@@ -818,20 +742,23 @@ impl Ernie4_5Model {
             self.invalidate_cuda_graph();
             return Ok(None);
         }
-        if inputs_embeds.shape() != captured.hidden_input.shape()
-            || position_ids.shape() != captured.position_input.shape()
+        if inputs_embeds.shape() != captured.inputs.hidden.shape()
+            || position_ids.shape() != captured.inputs.positions.shape()
         {
             return Ok(None);
         }
         captured
-            .hidden_input
+            .inputs
+            .hidden
             .slice_set(inputs_embeds, 0, 0)
             .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "copy graph hidden", e))?;
         captured
-            .position_input
+            .inputs
+            .positions
             .slice_set(position_ids, 0, 0)
             .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "copy graph positions", e))?;
         captured
+            .inputs
             .kv_lengths
             .update(kv_len)
             .map_err(|e| candle_to_ocr_inference("PaddleOCR-VL", "update graph KV lengths", e))?;
@@ -842,7 +769,7 @@ impl Ernie4_5Model {
         for layer in &self.layers {
             layer.set_kv_cache_len(kv_len)?;
         }
-        Ok(Some(captured.logits_output.clone()))
+        Ok(Some(captured.outputs[0].clone()))
     }
 
     #[cfg(feature = "cuda")]

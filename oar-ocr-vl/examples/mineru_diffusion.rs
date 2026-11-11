@@ -19,15 +19,16 @@ struct Args {
     model_dir: PathBuf,
     #[arg(required = true)]
     images: Vec<PathBuf>,
-    #[arg(short, long, default_value = "cpu")]
+    #[arg(short, long, default_value = "auto")]
     device: String,
     /// Run flat full-page recognition instead of two-stage parsing.
     #[arg(long, default_value_t = false)]
     single_pass: bool,
     #[arg(long)]
     prompt: Option<String>,
-    #[arg(long, default_value_t = 1024)]
-    gen_length: usize,
+    /// Token cap: 2048 for page parsing, 1024 for single-pass recognition.
+    #[arg(long)]
+    gen_length: Option<usize>,
     #[arg(long, default_value_t = 32)]
     block_length: usize,
     #[arg(long, default_value_t = 32)]
@@ -52,6 +53,7 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -65,7 +67,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Model loaded in {:.2?}", load_start.elapsed());
 
     let generation = DiffusionGenerationConfig {
-        gen_length: args.gen_length,
+        gen_length: args
+            .gen_length
+            .unwrap_or(if args.single_pass { 1024 } else { 2048 }),
         block_length: args.block_length,
         denoising_steps: args.denoising_steps,
         dynamic_threshold: args.dynamic_threshold,

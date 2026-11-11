@@ -1,6 +1,6 @@
 use crate::api::error::Error;
 use image::RgbImage;
-use image::imageops::FilterType;
+use image::imageops::{self, FilterType};
 use rayon::prelude::*;
 
 /// Convert an RGB image to a CHW tensor buffer with normalization and parallel processing.
@@ -142,6 +142,61 @@ pub fn patchify_merge_grouped(
     flat
 }
 
+/// Normalize a static RGB frame directly into merge-grouped patches.
+///
+/// Geometry is validated by the caller. Ordering matches
+/// [`patchify_merge_grouped`], with each channel's normalized patch copied
+/// across the temporal samples instead of normalizing the same pixels again.
+pub(crate) fn image_to_merge_grouped_patches(
+    image: &RgbImage,
+    mean: &[f32],
+    std: &[f32],
+    rescale_factor: Option<f32>,
+    patch_size: usize,
+    merge_size: usize,
+    temporal_patch: usize,
+) -> Vec<f32> {
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let grid_h = height / patch_size;
+    let grid_w = width / patch_size;
+    debug_assert_eq!(height % patch_size, 0);
+    debug_assert_eq!(width % patch_size, 0);
+    debug_assert_eq!(grid_h % merge_size, 0);
+    debug_assert_eq!(grid_w % merge_size, 0);
+
+    let patch_area = patch_size * patch_size;
+    let channel_len = temporal_patch * patch_area;
+    let patch_dim = 3 * channel_len;
+    let merge_area = merge_size * merge_size;
+    let grid_w_blocks = grid_w / merge_size;
+    let scale = rescale_factor.unwrap_or(1.0);
+    let rgb = image.as_raw();
+    let mut flat = vec![0.0; grid_h * grid_w * patch_dim];
+    flat.par_chunks_exact_mut(patch_dim)
+        .enumerate()
+        .for_each(|(index, patch)| {
+            let block = index / merge_area;
+            let within_block = index % merge_area;
+            let y = (block / grid_w_blocks * merge_size + within_block / merge_size) * patch_size;
+            let x = (block % grid_w_blocks * merge_size + within_block % merge_size) * patch_size;
+            for (c, channel) in patch.chunks_exact_mut(channel_len).enumerate() {
+                let (first, repeated) = channel.split_at_mut(patch_area);
+                for (ph, out_row) in first.chunks_exact_mut(patch_size).enumerate() {
+                    let row_start = ((y + ph) * width + x) * 3;
+                    for (pw, out) in out_row.iter_mut().enumerate() {
+                        let scaled = rgb[row_start + pw * 3 + c] as f32 * scale;
+                        *out = (scaled - mean[c]) / std[c];
+                    }
+                }
+                for frame in repeated.chunks_exact_mut(patch_area) {
+                    frame.copy_from_slice(first);
+                }
+            }
+        });
+    flat
+}
+
 /// Convert PIL/Transformers integer resampling constants to `image::FilterType`.
 ///
 /// Mappings:
@@ -163,6 +218,387 @@ pub fn pil_resample_to_filter_type(resample: u32) -> Option<FilterType> {
     }
 }
 
+/// Fractional bits of PIL's 8-bit-per-channel resampling coefficients
+/// (`PRECISION_BITS = 32 - 8 - 2` in `Resample.c`).
+const PIL_RESAMPLE_PRECISION_BITS: u32 = 22;
+
+/// A Pillow resampling filter: kernel support (in source pixels at unit
+/// scale) and the kernel itself.
+#[derive(Clone, Copy)]
+struct PilFilter {
+    support: f64,
+    kernel: fn(f64) -> f64,
+}
+
+const PIL_BICUBIC: PilFilter = PilFilter {
+    support: 2.0,
+    kernel: pil_bicubic_kernel,
+};
+
+const PIL_BILINEAR: PilFilter = PilFilter {
+    support: 1.0,
+    kernel: |t| (1.0 - t.abs()).max(0.0),
+};
+
+const PIL_LANCZOS: PilFilter = PilFilter {
+    support: 3.0,
+    kernel: pil_lanczos_kernel,
+};
+
+/// PIL's `bicubic` filter kernel: Keys a = -0.5 with support 2.
+fn pil_bicubic_kernel(t: f64) -> f64 {
+    const A: f64 = -0.5;
+    let t = t.abs();
+    if t < 1.0 {
+        ((A + 2.0) * t - (A + 3.0)) * t * t + 1.0
+    } else if t < 2.0 {
+        (((t - 5.0) * t + 8.0) * t - 4.0) * A
+    } else {
+        0.0
+    }
+}
+
+fn pil_sinc(x: f64) -> f64 {
+    if x == 0.0 {
+        1.0
+    } else {
+        let x = x * std::f64::consts::PI;
+        x.sin() / x
+    }
+}
+
+/// PIL's `lanczos` filter kernel: sinc windowed by sinc over `[-3, 3)`.
+fn pil_lanczos_kernel(t: f64) -> f64 {
+    if (-3.0..3.0).contains(&t) {
+        pil_sinc(t) * pil_sinc(t / 3.0)
+    } else {
+        0.0
+    }
+}
+
+/// Fixed-point tap weights of one resampling axis, per output sample.
+struct PilResampleAxis {
+    /// First source index per output sample.
+    bases: Vec<usize>,
+    /// Quantized weights for output sample `i` (PIL's clamped window).
+    weights: Vec<Vec<i32>>,
+}
+
+impl PilResampleAxis {
+    /// Reproduce PIL's coefficient construction for one axis: the tap window
+    /// spans `int(center - support + 0.5)` .. `int(center + support + 0.5)`
+    /// clamped to the source, weights are the filter kernel normalized to
+    /// unit sum and quantized with C `(int)` truncation at
+    /// [`PIL_RESAMPLE_PRECISION_BITS`] fractional bits.
+    fn new(in_dim: u32, out_dim: u32, filter: PilFilter) -> Self {
+        let scale = in_dim as f64 / out_dim as f64;
+        let filterscale = scale.max(1.0);
+        let support = filter.support * filterscale;
+        let ksize = (support.ceil() as usize) * 2 + 1;
+        let ss = 1.0 / filterscale;
+        let quantize = |weight: f64| -> i32 {
+            let scaled = weight * (1u64 << PIL_RESAMPLE_PRECISION_BITS) as f64;
+            // C `(int)(value ± 0.5)` truncates toward zero.
+            let rounded = if scaled >= 0.0 {
+                scaled + 0.5
+            } else {
+                scaled - 0.5
+            };
+            rounded as i64 as i32
+        };
+        let mut bases = Vec::with_capacity(out_dim as usize);
+        let mut weights = Vec::with_capacity(out_dim as usize);
+        for index in 0..out_dim as i64 {
+            let center = (index as f64 + 0.5) * scale;
+            let xmin = ((center - support + 0.5).trunc() as i64).max(0) as usize;
+            let xmax = ((center + support + 0.5).trunc() as i64).min(in_dim as i64) as usize;
+            let count = (xmax - xmin).min(ksize);
+            let mut row = vec![0f64; count];
+            for (tap, weight) in row.iter_mut().enumerate() {
+                let distance = (xmin + tap) as f64 - center + 0.5;
+                *weight = (filter.kernel)(distance * ss);
+            }
+            let sum: f64 = row.iter().sum();
+            if sum != 0.0 {
+                for weight in &mut row {
+                    *weight /= sum;
+                }
+            }
+            bases.push(xmin);
+            weights.push(row.iter().map(|w| quantize(*w)).collect());
+        }
+        Self { bases, weights }
+    }
+}
+
+/// Shift a fixed-point accumulator back to 8 bits with PIL's rounding bias
+/// and clamp, mirroring `clip8`.
+fn pil_fixed_to_u8(value: i64) -> u8 {
+    let rounded =
+        (value + (1i64 << (PIL_RESAMPLE_PRECISION_BITS - 1))) >> PIL_RESAMPLE_PRECISION_BITS;
+    rounded.clamp(0, 255) as u8
+}
+
+/// Resize using the Pillow implementation of the Qwen-VL resampling filter.
+/// Bicubic is the default (`resample=3`). Transformers' torchvision fast
+/// processors round differently and can differ by one intensity level.
+pub fn qwen_vl_resize(
+    image: &RgbImage,
+    width: u32,
+    height: u32,
+    resample: Option<u32>,
+) -> Result<RgbImage, Error> {
+    match resample {
+        None | Some(3) => pil_bicubic_resize(image, width, height),
+        Some(1) => pil_lanczos_resize(image, width, height),
+        Some(2) => pil_bilinear_resize(image, width, height),
+        Some(other) => {
+            let filter = pil_resample_to_filter_type(other).unwrap_or(FilterType::CatmullRom);
+            Ok(imageops::resize(image, width, height, filter))
+        }
+    }
+}
+
+/// PIL-exact bicubic resize of an RGB image, reproducing Pillow's
+/// `Resample.c` 8-bit pipeline: horizontal pass first with the fixed-point
+/// coefficients and a rounded uint8 intermediate, then the vertical pass.
+/// The `image` crate's `CatmullRom` is a close but different kernel
+/// discipline — it differs from PIL's output by up to ~24/255 at sharp
+/// edges, enough to shift vision-model logits — while this variant matches
+/// Pillow bit-for-bit.
+pub fn pil_bicubic_resize(image: &RgbImage, width: u32, height: u32) -> Result<RgbImage, Error> {
+    pil_resize(image, width, height, PIL_BICUBIC)
+}
+
+/// OpenCV's generic uint8 `INTER_CUBIC` path, without antialiasing.
+/// Optimized OpenCV SIMD/IPP paths can round some pixels differently.
+pub(crate) fn cv2_cubic_resize(
+    image: &RgbImage,
+    width: u32,
+    height: u32,
+) -> Result<RgbImage, Error> {
+    if image.width() == 0 || image.height() == 0 || width == 0 || height == 0 {
+        return Err(Error::invalid_input(
+            "Cubic resize requires nonempty images",
+        ));
+    }
+    if image.dimensions() == (width, height) {
+        return Ok(image.clone());
+    }
+    let horizontal = cv2_cubic_taps(image.width(), width);
+    let vertical = cv2_cubic_taps(image.height(), height);
+    let stride = width as usize * 3;
+    let mut rows = vec![0i32; stride * image.height() as usize];
+    rows.par_chunks_mut(stride)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, tap) in horizontal.iter().enumerate() {
+                for channel in 0..3 {
+                    row[x * 3 + channel] = tap
+                        .indices
+                        .iter()
+                        .zip(tap.weights)
+                        .map(|(&sx, weight)| {
+                            image.get_pixel(sx as u32, y as u32)[channel] as i32 * weight
+                        })
+                        .sum();
+                }
+            }
+        });
+    let mut output = RgbImage::new(width, height);
+    output
+        .as_mut()
+        .par_chunks_mut(stride)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let tap = &vertical[y];
+            for (index, value) in row.iter_mut().enumerate() {
+                let sum: i32 = tap
+                    .indices
+                    .iter()
+                    .zip(tap.weights)
+                    .map(|(&sy, weight)| rows[sy * stride + index] * weight)
+                    .sum();
+                *value = ((sum + (1 << 21)) >> 22).clamp(0, 255) as u8;
+            }
+        });
+    Ok(output)
+}
+
+struct Cv2CubicTap {
+    indices: [usize; 4],
+    weights: [i32; 4],
+}
+
+fn cv2_cubic_taps(input: u32, output: u32) -> Vec<Cv2CubicTap> {
+    // Adapted from OpenCV 4.13.0 imgproc/src/resize.cpp (Apache-2.0):
+    // interpolateCubic, HResizeCubic and FixedPtCast. Coefficients are f32,
+    // quantized to 11 bits with cvRound's ties-to-even; pixels round at 22 bits.
+    let scale = 1. / (output as f64 / input as f64);
+    (0..output)
+        .map(|position| {
+            let center = ((position as f64 + 0.5) * scale - 0.5) as f32;
+            let base = center.floor() as i64;
+            let x = center - base as f32;
+            let a = -0.75f32;
+            let c0 = ((a * (x + 1.) - 5. * a) * (x + 1.) + 8. * a) * (x + 1.) - 4. * a;
+            let c1 = ((a + 2.) * x - (a + 3.)) * x * x + 1.;
+            let c2 = ((a + 2.) * (1. - x) - (a + 3.)) * (1. - x) * (1. - x) + 1.;
+            Cv2CubicTap {
+                indices: std::array::from_fn(|k| {
+                    (base + k as i64 - 1).clamp(0, input as i64 - 1) as usize
+                }),
+                weights: [c0, c1, c2, 1. - c0 - c1 - c2]
+                    .map(|weight| (weight * 2048.).round_ties_even() as i32),
+            }
+        })
+        .collect()
+}
+
+/// Pillow-exact bilinear RGB resize, including the rounded uint8 intermediate.
+pub(crate) fn pil_bilinear_resize(
+    image: &RgbImage,
+    width: u32,
+    height: u32,
+) -> Result<RgbImage, Error> {
+    pil_resize(image, width, height, PIL_BILINEAR)
+}
+
+/// PIL-exact `Image.LANCZOS` resize of an RGB image; see
+/// [`pil_bicubic_resize`].
+pub(crate) fn pil_lanczos_resize(
+    image: &RgbImage,
+    width: u32,
+    height: u32,
+) -> Result<RgbImage, Error> {
+    pil_resize(image, width, height, PIL_LANCZOS)
+}
+
+/// Pillow `ImageOps.pad` for a square RGB canvas, including ties-to-even
+/// rounding of both the contained size and the centered paste offset.
+pub(crate) fn pil_pad_to_square(
+    image: &RgbImage,
+    size: u32,
+    color: [u8; 3],
+) -> Result<RgbImage, Error> {
+    if image.width() == 0 || image.height() == 0 || size == 0 {
+        return Err(Error::invalid_input(
+            "square padding requires nonzero dimensions",
+        ));
+    }
+    let (width, height) = image.dimensions();
+    let round = |value: f64| (value.round_ties_even() as u32).max(1);
+    let (new_width, new_height) = match width.cmp(&height) {
+        std::cmp::Ordering::Equal => (size, size),
+        std::cmp::Ordering::Greater => (
+            size,
+            round(f64::from(height) / f64::from(width) * f64::from(size)),
+        ),
+        std::cmp::Ordering::Less => (
+            round(f64::from(width) / f64::from(height) * f64::from(size)),
+            size,
+        ),
+    };
+    let resized = pil_bicubic_resize(image, new_width, new_height)?;
+    if (new_width, new_height) == (size, size) {
+        return Ok(resized);
+    }
+    let mut canvas = RgbImage::from_pixel(size, size, image::Rgb(color));
+    let offset = |free: u32| (f64::from(free) * 0.5).round_ties_even() as i64;
+    if new_width != size {
+        imageops::overlay(&mut canvas, &resized, offset(size - new_width), 0);
+    } else {
+        imageops::overlay(&mut canvas, &resized, 0, offset(size - new_height));
+    }
+    Ok(canvas)
+}
+
+fn pil_resize(
+    image: &RgbImage,
+    width: u32,
+    height: u32,
+    filter: PilFilter,
+) -> Result<RgbImage, Error> {
+    if width == 0 || height == 0 {
+        return Err(Error::InvalidInput {
+            message: format!("pil_resize: invalid target {width}x{height}"),
+        });
+    }
+    let (in_w, in_h) = image.dimensions();
+    if width == in_w && height == in_h {
+        return Ok(image.clone());
+    }
+    // Horizontal pass into a rounded uint8 intermediate, like PIL.
+    let mid = if width != in_w {
+        let axis = PilResampleAxis::new(in_w, width, filter);
+        let src = image.as_raw();
+        let src_stride = in_w as usize * 3;
+        let out_stride = width as usize * 3;
+        let mut buffer = vec![0u8; out_stride * in_h as usize];
+        buffer
+            .par_chunks_exact_mut(out_stride)
+            .enumerate()
+            .for_each(|(y, out_row)| {
+                let src_row = &src[y * src_stride..(y + 1) * src_stride];
+                for x in 0..width as usize {
+                    let base = axis.bases[x];
+                    let weights = &axis.weights[x];
+                    let mut acc = [0i64; 3];
+                    for (tap, weight) in weights.iter().enumerate() {
+                        let weight = *weight as i64;
+                        let pixel = &src_row[(base + tap) * 3..(base + tap) * 3 + 3];
+                        for channel in 0..3 {
+                            acc[channel] += weight * pixel[channel] as i64;
+                        }
+                    }
+                    for channel in 0..3 {
+                        out_row[x * 3 + channel] = pil_fixed_to_u8(acc[channel]);
+                    }
+                }
+            });
+        std::borrow::Cow::Owned(RgbImage::from_raw(width, in_h, buffer).ok_or_else(|| {
+            Error::InvalidInput {
+                message: "pil_resize: intermediate buffer size mismatch".to_string(),
+            }
+        })?)
+    } else {
+        std::borrow::Cow::Borrowed(image)
+    };
+    // Vertical pass over the intermediate.
+    if height != in_h {
+        let axis = PilResampleAxis::new(in_h, height, filter);
+        let mid_raw = mid.as_raw();
+        let stride = width as usize * 3;
+        let mut buffer = vec![0u8; stride * height as usize];
+        buffer
+            .par_chunks_exact_mut(stride)
+            .enumerate()
+            .for_each_init(
+                || vec![0i64; stride],
+                |acc, (y, out_row)| {
+                    let base = axis.bases[y];
+                    let weights = &axis.weights[y];
+                    acc.fill(0);
+                    for (tap, weight) in weights.iter().enumerate() {
+                        let weight = *weight as i64;
+                        let src_row = &mid_raw[(base + tap) * stride..(base + tap + 1) * stride];
+                        for (accumulator, sample) in acc.iter_mut().zip(src_row) {
+                            *accumulator += weight * *sample as i64;
+                        }
+                    }
+                    for (sample, &accumulator) in out_row.iter_mut().zip(acc.iter()) {
+                        *sample = pil_fixed_to_u8(accumulator);
+                    }
+                },
+            );
+        RgbImage::from_raw(width, height, buffer).ok_or_else(|| Error::InvalidInput {
+            message: "pil_resize: output buffer size mismatch".to_string(),
+        })
+    } else {
+        Ok(mid.into_owned())
+    }
+}
+
 /// Round up a value to the next multiple of a factor.
 pub fn round_up_to_multiple(value: u32, multiple: u32) -> u32 {
     if multiple == 0 {
@@ -173,7 +609,8 @@ pub fn round_up_to_multiple(value: u32, multiple: u32) -> u32 {
 
 /// Smart resize calculating new dimensions based on pixel constraints and factor alignment.
 ///
-/// Used by PaddleOCR-VL and HunyuanOCR.
+/// Mirrors the Qwen2-VL-family `smart_resize` in transformers, including
+/// Python's `round` (halves round to even).
 pub fn smart_resize(
     height: u32,
     width: u32,
@@ -202,8 +639,8 @@ pub fn smart_resize(
         });
     }
 
-    let mut h_bar = (height / factor_f).round() * factor_f;
-    let mut w_bar = (width / factor_f).round() * factor_f;
+    let mut h_bar = (height / factor_f).round_ties_even() * factor_f;
+    let mut w_bar = (width / factor_f).round_ties_even() * factor_f;
 
     let area = h_bar * w_bar;
     if area > max_pixels as f64 {
@@ -309,44 +746,71 @@ pub fn clamp_to_max_image_size(
 /// 1. If the aspect ratio exceeds `max_aspect_ratio`, the image is padded with
 ///    white to bring it within bounds.
 /// 2. If the minimum edge is below `min_edge`, the image is scaled up.
+///
+/// Empty images are returned unchanged.
 pub fn resize_for_mineru(image: &RgbImage, min_edge: u32, max_aspect_ratio: f32) -> RgbImage {
-    use image::{Rgb, imageops};
+    resize_padded(image, min_edge, max_aspect_ratio, ResizeRounding::Up)
+        .unwrap_or_else(|_| image.clone())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResizeRounding {
+    Up,
+    Nearest,
+}
+
+pub(crate) fn resize_padded(
+    image: &RgbImage,
+    min_edge: u32,
+    max_aspect_ratio: f32,
+    rounding: ResizeRounding,
+) -> Result<RgbImage, Error> {
     use std::borrow::Cow;
-
     let (mut w, mut h) = image.dimensions();
+    if w == 0 || h == 0 || !max_aspect_ratio.is_finite() || max_aspect_ratio <= 0. {
+        return Err(Error::invalid_input(
+            "resize requires a nonempty image and a positive aspect bound",
+        ));
+    }
     let mut out = Cow::Borrowed(image);
-
-    // Handle extreme aspect ratios by padding
-    let ratio = (w.max(h) as f32) / (w.min(h).max(1) as f32);
-    if ratio > max_aspect_ratio {
+    if f64::from(w.max(h)) / f64::from(w.min(h)) > f64::from(max_aspect_ratio) {
         let (new_w, new_h) = if w > h {
-            (w, (w as f32 / max_aspect_ratio).ceil() as u32)
+            (
+                w,
+                (f64::from(w) / f64::from(max_aspect_ratio)).ceil() as u32,
+            )
         } else {
-            ((h as f32 / max_aspect_ratio).ceil() as u32, h)
+            (
+                (f64::from(h) / f64::from(max_aspect_ratio)).ceil() as u32,
+                h,
+            )
         };
-        let mut canvas = RgbImage::from_pixel(new_w, new_h, Rgb([255, 255, 255]));
-        let x = ((new_w - w) / 2) as i64;
-        let y = ((new_h - h) / 2) as i64;
-        imageops::overlay(&mut canvas, &*out, x, y);
+        let mut canvas = RgbImage::from_pixel(new_w, new_h, image::Rgb([255; 3]));
+        imageops::overlay(
+            &mut canvas,
+            image,
+            ((new_w - w) / 2) as i64,
+            ((new_h - h) / 2) as i64,
+        );
         out = Cow::Owned(canvas);
         (w, h) = out.dimensions();
     }
-
-    // Scale up if minimum edge is too small
-    let min_dim = w.min(h);
-    if min_dim < min_edge {
-        let scale = min_edge as f32 / min_dim as f32;
-        let new_w = (w as f32 * scale).ceil() as u32;
-        let new_h = (h as f32 * scale).ceil() as u32;
-        out = Cow::Owned(imageops::resize(
-            &*out,
-            new_w,
-            new_h,
-            imageops::FilterType::CatmullRom,
-        ));
+    if w.min(h) < min_edge {
+        let scale = f64::from(min_edge) / f64::from(w.min(h));
+        let round = |value: f64| {
+            match rounding {
+                ResizeRounding::Up => value.ceil(),
+                ResizeRounding::Nearest => value.round_ties_even(),
+            }
+            .max(1.) as u32
+        };
+        out = Cow::Owned(pil_bicubic_resize(
+            &out,
+            round(f64::from(w) * scale),
+            round(f64::from(h) * scale),
+        )?);
     }
-
-    out.into_owned()
+    Ok(out.into_owned())
 }
 
 /// Loads an image from disk and converts it to RGB.
@@ -370,6 +834,166 @@ pub fn load_image_from_memory(bytes: &[u8]) -> Result<RgbImage, crate::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mineru_resize_preserves_empty_images() {
+        for (width, height) in [(0, 0), (0, 10)] {
+            let image = RgbImage::new(width, height);
+            assert_eq!(resize_for_mineru(&image, 28, 50.0), image);
+        }
+    }
+
+    #[test]
+    fn square_padding_matches_pillow_size_and_offset_rounding() {
+        let white = image::Rgb([255; 3]);
+        let gray = image::Rgb([127; 3]);
+        let source = RgbImage::from_pixel(2048, 1025, white);
+        let out = pil_pad_to_square(&source, 1024, [127; 3]).unwrap();
+        assert_eq!(out.get_pixel(512, 255), &gray);
+        assert_eq!(out.get_pixel(512, 256), &white);
+        assert_eq!(out.get_pixel(512, 767), &white);
+        assert_eq!(out.get_pixel(512, 768), &gray);
+        // Three free rows center at round(1.5) = 2, rather than floor(1.5).
+        let out = pil_pad_to_square(&RgbImage::from_pixel(2, 1, white), 6, [127; 3]).unwrap();
+        assert_eq!(out.get_pixel(3, 1), &gray);
+        assert_eq!(out.get_pixel(3, 2), &white);
+        assert_eq!(out.get_pixel(3, 4), &white);
+        assert_eq!(out.get_pixel(3, 5), &gray);
+    }
+
+    /// Bit-exactness against Pillow is the entire point of the PIL resize:
+    /// the golden pairs below were produced with Pillow 12.1.0
+    /// (`Image.resize(..., Image.BICUBIC)`) from a deterministic 12x9 RGB
+    /// pattern, covering a downscale (7x5) and an upscale (13x10) of both
+    /// axes.
+    #[test]
+    fn pil_bicubic_resize_matches_pillow() {
+        let src = [
+            0, 0, 0, 23, 11, 3, 46, 22, 6, 69, 33, 9, 92, 44, 12, 115, 55, 15, 138, 66, 18, 161,
+            77, 21, 184, 88, 24, 207, 99, 27, 230, 110, 30, 253, 121, 33, 5, 29, 61, 28, 40, 64,
+            51, 51, 67, 74, 62, 70, 97, 73, 73, 120, 84, 76, 143, 95, 79, 166, 106, 82, 189, 117,
+            85, 212, 128, 88, 235, 139, 91, 2, 150, 94, 10, 58, 122, 33, 69, 125, 56, 80, 128, 79,
+            91, 131, 102, 102, 134, 125, 113, 137, 148, 124, 140, 171, 135, 143, 194, 146, 146,
+            217, 157, 149, 240, 168, 152, 7, 179, 155, 15, 87, 183, 38, 98, 186, 61, 109, 189, 84,
+            120, 192, 107, 131, 195, 130, 142, 198, 153, 153, 201, 176, 164, 204, 199, 175, 207,
+            222, 186, 210, 245, 197, 213, 12, 208, 216, 20, 116, 244, 43, 127, 247, 66, 138, 250,
+            89, 149, 253, 112, 160, 0, 135, 171, 3, 158, 182, 6, 181, 193, 9, 204, 204, 12, 227,
+            215, 15, 250, 226, 18, 17, 237, 21, 25, 145, 49, 48, 156, 52, 71, 167, 55, 94, 178, 58,
+            117, 189, 61, 140, 200, 64, 163, 211, 67, 186, 222, 70, 209, 233, 73, 232, 244, 76,
+            255, 255, 79, 22, 10, 82, 30, 174, 110, 53, 185, 113, 76, 196, 116, 99, 207, 119, 122,
+            218, 122, 145, 229, 125, 168, 240, 128, 191, 251, 131, 214, 6, 134, 237, 17, 137, 4,
+            28, 140, 27, 39, 143, 35, 203, 171, 58, 214, 174, 81, 225, 177, 104, 236, 180, 127,
+            247, 183, 150, 2, 186, 173, 13, 189, 196, 24, 192, 219, 35, 195, 242, 46, 198, 9, 57,
+            201, 32, 68, 204, 40, 232, 232, 63, 243, 235, 86, 254, 238, 109, 9, 241, 132, 20, 244,
+            155, 31, 247, 178, 42, 250, 201, 53, 253, 224, 64, 0, 247, 75, 3, 14, 86, 6, 37, 97, 9,
+        ];
+        let expected = [
+            11, 17, 27, 49, 35, 32, 89, 55, 37, 129, 74, 43, 168, 92, 48, 213, 112, 53, 178, 130,
+            58, 20, 66, 140, 58, 84, 145, 98, 104, 150, 138, 123, 156, 177, 141, 161, 227, 161,
+            166, 104, 184, 171, 29, 120, 188, 67, 138, 196, 107, 159, 102, 147, 182, 59, 186, 202,
+            67, 239, 229, 72, 124, 206, 77, 38, 173, 94, 76, 195, 99, 116, 216, 104, 156, 199, 110,
+            199, 167, 118, 207, 91, 130, 49, 62, 135, 47, 228, 207, 85, 211, 212, 125, 106, 217,
+            165, 28, 226, 210, 40, 183, 195, 51, 95, 16, 76, 102,
+        ];
+        let src = RgbImage::from_raw(12, 9, src.to_vec()).expect("source buffer");
+        let out = pil_bicubic_resize(&src, 7, 5).expect("resize");
+        assert_eq!(out.dimensions(), (7, 5));
+        assert_eq!(out.as_raw(), &expected[..], "must match Pillow bit-for-bit");
+        // Upscale golden from the same source, also Pillow 12.1.0.
+        let expected_up = [
+            0, 0, 0, 20, 9, 2, 42, 19, 4, 63, 29, 7, 84, 39, 10, 105, 49, 13, 127, 60, 16, 148, 70,
+            18, 169, 80, 21, 190, 90, 24, 211, 100, 27, 233, 110, 29, 255, 120, 32, 4, 24, 51, 24,
+            34, 54, 46, 44, 56, 67, 54, 59, 88, 64, 62, 109, 74, 65, 131, 85, 68, 152, 95, 70, 173,
+            105, 73, 194, 115, 76, 219, 125, 79, 219, 135, 81, 29, 145, 84, 9, 51, 107, 29, 61,
+            110, 51, 71, 112, 72, 81, 115, 93, 91, 118, 114, 101, 121, 136, 112, 124, 157, 122,
+            126, 178, 132, 129, 199, 142, 132, 224, 152, 135, 220, 162, 137, 0, 172, 140, 13, 77,
+            162, 33, 87, 165, 55, 97, 167, 76, 107, 169, 97, 117, 186, 118, 127, 195, 140, 138,
+            198, 161, 148, 200, 182, 158, 203, 203, 168, 206, 228, 178, 209, 225, 188, 211, 6, 198,
+            214, 18, 103, 234, 38, 113, 237, 60, 123, 239, 81, 133, 244, 102, 143, 134, 123, 153,
+            85, 145, 164, 90, 166, 174, 92, 187, 184, 95, 208, 194, 98, 233, 204, 101, 230, 215,
+            103, 11, 242, 106, 22, 129, 159, 42, 139, 162, 64, 149, 164, 85, 159, 169, 106, 169,
+            59, 127, 179, 11, 149, 190, 15, 170, 199, 17, 191, 215, 20, 212, 235, 23, 240, 246, 26,
+            248, 244, 28, 15, 136, 31, 27, 155, 51, 47, 165, 54, 69, 175, 56, 90, 185, 59, 111,
+            195, 75, 132, 211, 84, 154, 227, 87, 175, 240, 89, 196, 218, 92, 219, 162, 95, 229,
+            178, 98, 163, 170, 100, 21, 0, 103, 31, 181, 125, 51, 191, 128, 73, 201, 130, 94, 216,
+            133, 115, 230, 136, 136, 203, 139, 158, 188, 142, 179, 209, 144, 200, 141, 149, 229, 0,
+            156, 202, 8, 159, 0, 20, 161, 29, 47, 164, 36, 208, 181, 56, 218, 184, 78, 228, 186,
+            99, 215, 189, 120, 229, 192, 141, 86, 195, 163, 0, 198, 184, 9, 201, 205, 23, 194, 233,
+            43, 177, 210, 53, 180, 1, 63, 182, 33, 73, 185, 40, 233, 233, 60, 243, 236, 82, 255,
+            238, 103, 59, 241, 124, 0, 244, 145, 24, 247, 167, 38, 250, 188, 48, 255, 209, 58, 174,
+            237, 68, 0, 214, 78, 0, 5, 88, 1, 37, 98, 4,
+        ];
+        let up = pil_bicubic_resize(&src, 13, 10).expect("upscale");
+        assert_eq!(up.dimensions(), (13, 10));
+        assert_eq!(
+            up.as_raw(),
+            &expected_up[..],
+            "upscale must match Pillow too"
+        );
+        let identity = pil_bicubic_resize(&src, 12, 9).expect("identity");
+        assert_eq!(identity.as_raw(), src.as_raw());
+    }
+
+    /// PaddleOCR-VL's spotting upscale: Pillow 12.1.0
+    /// `Image.resize((10, 8), Image.LANCZOS)` of the 5x4 pattern below.
+    #[test]
+    fn pil_lanczos_resize_matches_pillow() {
+        let src: Vec<u8> = (0..4u32)
+            .flat_map(|y| (0..5u32).flat_map(move |x| (0..3u32).map(move |c| (x, y, c))))
+            .map(|(x, y, c)| ((x * 67 + y * 131 + c * 29) * 53 % 256) as u8)
+            .collect();
+        let expected = [
+            3, 3, 0, 39, 40, 51, 157, 158, 193, 240, 241, 255, 209, 210, 222, 173, 174, 169, 163,
+            164, 162, 143, 144, 146, 126, 127, 128, 118, 119, 120, 0, 0, 7, 52, 53, 39, 184, 185,
+            137, 255, 255, 209, 221, 222, 206, 177, 178, 188, 168, 169, 174, 151, 152, 151, 134,
+            135, 135, 125, 126, 127, 0, 0, 32, 72, 73, 20, 211, 212, 44, 255, 255, 94, 235, 236,
+            179, 188, 189, 220, 182, 183, 199, 168, 169, 164, 151, 152, 151, 142, 143, 144, 15, 16,
+            57, 69, 70, 13, 160, 161, 0, 221, 221, 27, 255, 255, 193, 234, 234, 255, 214, 215, 232,
+            183, 184, 178, 167, 168, 167, 161, 162, 163, 57, 58, 71, 45, 46, 30, 47, 48, 0, 119,
+            120, 62, 245, 246, 227, 255, 255, 255, 243, 244, 250, 191, 192, 191, 179, 180, 180,
+            176, 177, 178, 88, 89, 84, 51, 52, 61, 12, 13, 40, 47, 48, 75, 151, 152, 162, 212, 212,
+            208, 238, 239, 238, 216, 217, 219, 203, 204, 205, 191, 192, 193, 96, 97, 95, 79, 80,
+            85, 56, 57, 70, 32, 33, 47, 43, 44, 49, 109, 110, 109, 214, 215, 215, 246, 246, 247,
+            228, 229, 231, 201, 202, 203, 96, 97, 100, 97, 98, 97, 93, 94, 88, 36, 36, 29, 0, 0, 0,
+            46, 47, 50, 197, 198, 199, 255, 255, 255, 241, 242, 243, 206, 207, 208,
+        ];
+        let src = RgbImage::from_raw(5, 4, src).expect("source buffer");
+        let out = pil_lanczos_resize(&src, 10, 8).expect("resize");
+        assert_eq!(out.as_raw(), &expected[..], "must match Pillow bit-for-bit");
+    }
+
+    #[test]
+    fn pil_bilinear_resize_matches_pillow() {
+        // Pillow Image.resize(..., Image.Resampling.BILINEAR), RGB uint8.
+        let src = RgbImage::from_fn(5, 4, |x, y| {
+            image::Rgb([
+                ((x * 71 + y * 13) % 256) as u8,
+                ((x * 31 + y * 83) % 256) as u8,
+                ((x * 109 + y * 47) % 256) as u8,
+            ])
+        });
+        let down = pil_bilinear_resize(&src, 3, 2).unwrap();
+        assert_eq!(
+            down.as_raw(),
+            &[
+                39, 72, 81, 151, 113, 113, 116, 134, 146, 60, 156, 154, 172, 118, 126, 137, 81,
+                115,
+            ]
+        );
+        let up = pil_bilinear_resize(&src, 7, 6).unwrap();
+        assert_eq!(
+            up.as_raw(),
+            &[
+                0, 0, 0, 41, 18, 62, 91, 40, 140, 142, 62, 218, 193, 84, 113, 134, 106, 118, 28,
+                124, 180, 7, 42, 24, 48, 60, 86, 98, 82, 127, 149, 104, 114, 200, 126, 100, 141,
+                148, 142, 35, 166, 204, 15, 97, 55, 56, 115, 117, 106, 137, 122, 157, 159, 17, 208,
+                150, 95, 149, 160, 154, 43, 178, 192, 24, 152, 86, 65, 170, 148, 115, 192, 153,
+                166, 214, 48, 217, 84, 126, 158, 45, 113, 52, 63, 53, 33, 208, 118, 74, 152, 180,
+                124, 120, 185, 175, 142, 80, 226, 72, 158, 167, 58, 126, 61, 76, 42, 39, 249, 141,
+                80, 120, 203, 130, 33, 208, 181, 55, 103, 232, 77, 181, 173, 99, 149, 67, 117, 65,
+            ]
+        );
+    }
 
     /// Callers pass paths straight from a CLI, where an extensionless or
     /// mislabelled file is ordinary. The format must come from the bytes.
@@ -460,10 +1084,10 @@ mod tests {
     }
 
     #[test]
-    fn test_smart_resize_factor_divisibility() -> Result<(), Error> {
-        let (h, w) = smart_resize(100, 200, 28, 147_384, 2_822_400)?;
-        assert_eq!(h % 28, 0);
-        assert_eq!(w % 28, 0);
+    fn test_smart_resize_matches_the_python_reference() -> Result<(), Error> {
+        // 70 / 28 = 2.5 rounds to 2 like Python's `round`.
+        assert_eq!(smart_resize(70, 210, 28, 3_136, 12_845_056)?, (56, 224));
+        assert_eq!(smart_resize(350, 630, 28, 3_136, 12_845_056)?, (336, 616));
         Ok(())
     }
 

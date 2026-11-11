@@ -11,10 +11,10 @@
 //! block begins.
 
 use super::config::MinerUDiffusionConfig;
-use super::projector::VisionAbstractor;
 use super::text::{SdarKvCache, SdarModel};
-use crate::backbones::qwen_vl_processing::{MinerUImageProcessorConfig, preprocess_images};
-use crate::backbones::qwen2_vl::MinerUVisionModel;
+use crate::backbones::patch_merger::{MergerKeys, SpatialPatchMerger};
+use crate::backbones::qwen_vl_processing::{QwenVlImageProcessorConfig, preprocess_images};
+use crate::backbones::qwen2_vl::Qwen2VlVisionModel;
 use crate::error::Error;
 #[cfg(feature = "cuda")]
 use crate::runtime::cuda::SampleWithConfidence;
@@ -82,10 +82,10 @@ pub struct MinerUDiffusion {
     device: Device,
     dtype: DType,
     cfg: MinerUDiffusionConfig,
-    image_cfg: MinerUImageProcessorConfig,
+    image_cfg: QwenVlImageProcessorConfig,
     tokenizer: Tokenizer,
-    vision: MinerUVisionModel,
-    abstractor: VisionAbstractor,
+    vision: Qwen2VlVisionModel,
+    abstractor: SpatialPatchMerger,
     text: SdarModel,
     image_token_id: u32,
     mask_token_id: u32,
@@ -106,7 +106,7 @@ impl MinerUDiffusion {
         let model_dir = model_dir.as_ref();
         let cfg = MinerUDiffusionConfig::from_path(model_dir.join("config.json"))?;
         let mut image_cfg =
-            MinerUImageProcessorConfig::from_path(model_dir.join("preprocessor_config.json"))?;
+            QwenVlImageProcessorConfig::from_path(model_dir.join("preprocessor_config.json"))?;
         // MinerU-Diffusion ships both an explicit `min/max_pixels` pair and a
         // `size` block whose `longest_edge` (12845056) is the absolute ceiling,
         // not the operating cap. When both are present, prefer the explicit
@@ -140,12 +140,17 @@ impl MinerUDiffusion {
         };
 
         let merge_size = cfg.projector_merge_size()?;
-        let vision = MinerUVisionModel::load_backbone(&cfg.vision_config, vb.pp("vision_model"))?;
-        let abstractor = VisionAbstractor::load(
+        let vision = Qwen2VlVisionModel::load_backbone(&cfg.vision_config, vb.pp("vision_model"))?;
+        // `patch_merger2x`: the reference Qwen2-VL `PatchMerger` over the
+        // backbone's per-patch hidden states.
+        let abstractor = SpatialPatchMerger::load(
             vb.pp("vision_abstractor").pp("projection"),
+            MergerKeys::QWEN2_VL,
             cfg.vision_config.embed_dim,
-            cfg.text_config.hidden_size,
             merge_size,
+            cfg.text_config.hidden_size,
+            false,
+            "MinerU-Diffusion",
         )?;
         let text = SdarModel::load(&cfg.text_config, vb.pp("language_model"), dtype)?;
 
@@ -256,6 +261,7 @@ impl MinerUDiffusion {
             &self.image_cfg,
             &self.device,
             self.dtype,
+            "MinerU-Diffusion",
         )?;
         let patches = self
             .vision
@@ -525,7 +531,6 @@ fn sample_tokens_and_conf(
         && matches!(logits.dtype(), DType::BF16 | DType::F32)
         && top_k == 0
         && top_p >= 1.0
-        && std::env::var_os("OAR_MINERU_DIFFUSION_DISABLE_GPU_SAMPLING").is_none()
     {
         return sample_tokens_and_conf_cuda(logits, temperature, rng);
     }
@@ -580,8 +585,7 @@ fn sample_tokens_and_conf(
 /// Fast path for the reference/default sampling configuration. The model's
 /// logits remain on the GPU; only two F32 values per block position (token id
 /// and selected probability) cross to the host. The CPU fallback above stays
-/// available for top-k/top-p filters and as a numerical/debugging oracle via
-/// `OAR_MINERU_DIFFUSION_DISABLE_GPU_SAMPLING=1`.
+/// handles top-k/top-p filters.
 #[cfg(feature = "cuda")]
 fn sample_tokens_and_conf_cuda(
     logits: &Tensor,

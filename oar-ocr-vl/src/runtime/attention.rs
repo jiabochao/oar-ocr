@@ -22,29 +22,7 @@
 use crate::error::Error;
 use crate::runtime::errors::candle_to_ocr_processing;
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
-use std::sync::OnceLock;
-
-fn grouped_query_attention_disabled() -> bool {
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("OAR_VL_DISABLE_GQA").is_some())
-}
-
-/// Native half-precision eager softmax is opt-in on Metal. Fused SDPA has its
-/// own softmax implementation and is unaffected by these switches.
-fn metal_native_softmax_enabled(dtype: DType) -> bool {
-    static FORCE_NATIVE: OnceLock<bool> = OnceLock::new();
-    static FORCE_F32: OnceLock<bool> = OnceLock::new();
-    let force_native =
-        *FORCE_NATIVE.get_or_init(|| std::env::var_os("OAR_VL_METAL_NATIVE_SOFTMAX").is_some());
-    let force_f32 =
-        *FORCE_F32.get_or_init(|| std::env::var_os("OAR_VL_METAL_F32_SOFTMAX").is_some());
-    !force_f32 && force_native && matches!(dtype, DType::F16 | DType::BF16)
-}
-
-fn metal_sdpa_disabled() -> bool {
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("OAR_VL_DISABLE_METAL_SDPA").is_some())
-}
+use std::collections::VecDeque;
 
 /// Fused Metal SDPA attempt; `Ok(None)` when unavailable or declined, so
 /// callers keep their own eager fallback.
@@ -69,7 +47,7 @@ fn try_metal_sdpa(
     is_causal: bool,
     allow_vector_kernel: bool,
 ) -> Result<Option<Tensor>> {
-    if metal_sdpa_disabled() || !q.device().is_metal() {
+    if !q.device().is_metal() {
         return Ok(None);
     }
     let Ok((batch, num_heads, query_len, head_dim)) = q.dims4() else {
@@ -154,10 +132,20 @@ fn try_metal_sdpa(
     Ok(fused.ok())
 }
 
-#[cfg(feature = "cuda")]
-fn flash_attention_disabled() -> bool {
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var_os("OAR_VL_DISABLE_FLASH_ATTN").is_some())
+/// Whether `flash_attention` will run per-row attention for `dtype` tensors
+/// on `device`. Callers use it to skip work the flash path makes redundant
+/// — for example materializing a quadratic batch attention mask that the
+/// row-split flash path never reads.
+pub fn row_flash_attention_available(device: &Device, dtype: DType) -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        device.is_cuda() && flash_attention_dtype_supported(dtype)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (device, dtype);
+        false
+    }
 }
 
 /// Helper function to handle Metal device computation.
@@ -233,22 +221,32 @@ pub fn scaled_dot_product_attention(
         None => attn_weights,
     };
 
-    // Softmax: cast to F32 for numerical stability, then cast back. Metal can
-    // opt into its native half-precision kernel to avoid two conversions.
+    // Compute eager softmax in F32, then restore the input dtype.
     let input_dtype = attn_weights.dtype();
-    let use_native_metal_softmax = q.device().is_metal()
-        && input_dtype != DType::F32
-        && metal_native_softmax_enabled(input_dtype);
-    let attn_weights = if use_native_metal_softmax {
-        candle_nn::ops::softmax_last_dim(&attn_weights)?
-    } else {
-        let attn_weights = attn_weights.to_dtype(DType::F32)?;
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        attn_weights.to_dtype(input_dtype)?
-    };
+    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights.to_dtype(DType::F32)?)?
+        .to_dtype(input_dtype)?;
 
     // Attention @ V
     attn_weights.matmul(v)
+}
+
+/// Soft cap for one attention chunk's F32 score scratch (~110 MiB — the
+/// same footprint the shared 256-row vision default produces at ~6.9K
+/// patches).
+pub(crate) const ATTENTION_CHUNK_SCRATCH_BUDGET: usize = 110 * 1024 * 1024;
+
+/// Largest query chunk whose F32 score scratch — one F32 row per head per
+/// KV position — stays within `budget`. Callers clamp to their preferred
+/// chunk so behavior only changes when a page outgrows it.
+pub(crate) fn attention_query_chunk(num_heads: usize, kv_len: usize, budget: usize) -> usize {
+    // Checked so an adversarial size cannot overflow: an overflowing row
+    // is far beyond any budget, and the chunk floors at one row.
+    let per_row = num_heads
+        .max(1)
+        .checked_mul(kv_len.max(1))
+        .and_then(|v| v.checked_mul(4))
+        .unwrap_or(usize::MAX);
+    (budget / per_row).max(1)
 }
 
 /// Sequence length above which vision backends use query-chunked attention to
@@ -305,11 +303,6 @@ pub fn scaled_dot_product_attention_gqa(
     if num_kv_groups == 1 {
         return scaled_dot_product_attention(q, k, v, mask, scale, is_causal);
     }
-    if grouped_query_attention_disabled() {
-        let k = repeat_kv(k, num_kv_groups)?;
-        let v = repeat_kv(v, num_kv_groups)?;
-        return scaled_dot_product_attention(q, &k, &v, mask, scale, is_causal);
-    }
 
     let (batch, num_heads, query_len, head_dim) = q.dims4()?;
     let (k_batch, num_kv_heads, kv_len, k_head_dim) = k.dims4()?;
@@ -334,12 +327,25 @@ pub fn scaled_dot_product_attention_gqa(
         return Ok(output);
     }
 
-    let grouped_batch = batch * num_kv_heads;
     let grouped_queries = num_kv_groups * query_len;
-    let grouped_q = q.reshape((grouped_batch, grouped_queries, head_dim))?;
-    let grouped_k = k
-        .reshape((grouped_batch, kv_len, head_dim))?
-        .transpose(1, 2)?;
+    let grouped_q = q.reshape((batch, num_kv_heads, grouped_queries, head_dim))?;
+    // Preserve the cache's batch/head strides: flattening these axes would
+    // materialize the entire logical history when capacity exceeds kv_len.
+    let cache_layout = |tensor: &Tensor| -> Result<Tensor> {
+        let stride = tensor.stride();
+        if stride[3] == 1
+            && stride[2] == head_dim
+            && stride[1] >= kv_len * head_dim
+            && stride[0] == num_kv_heads * stride[1]
+        {
+            Ok(tensor.clone())
+        } else {
+            // Arbitrary public-API inputs can have nonuniform batch strides;
+            // retain the old materialization for layouts matmul cannot use.
+            tensor.contiguous()
+        }
+    };
+    let grouped_k = cache_layout(k)?.transpose(2, 3)?;
     let mut weights =
         (grouped_q.matmul(&grouped_k)? * scale)?.reshape((batch, num_heads, query_len, kv_len))?;
 
@@ -353,18 +359,11 @@ pub fn scaled_dot_product_attention_gqa(
     };
 
     let weight_dtype = weights.dtype();
-    let use_native_metal_softmax = q.device().is_metal()
-        && weight_dtype != DType::F32
-        && metal_native_softmax_enabled(weight_dtype);
-    let weights = if use_native_metal_softmax {
-        candle_nn::ops::softmax_last_dim(&weights)?
-    } else {
-        candle_nn::ops::softmax_last_dim(&weights.to_dtype(DType::F32)?)?.to_dtype(weight_dtype)?
-    }
-    .reshape((grouped_batch, grouped_queries, kv_len))?;
-    let grouped_v = v.reshape((grouped_batch, kv_len, head_dim))?;
+    let weights = candle_nn::ops::softmax_last_dim(&weights.to_dtype(DType::F32)?)?
+        .to_dtype(weight_dtype)?
+        .reshape((batch, num_kv_heads, grouped_queries, kv_len))?;
     weights
-        .matmul(&grouped_v)?
+        .matmul(&cache_layout(v)?)?
         .reshape((batch, num_heads, query_len, head_dim))
 }
 
@@ -498,8 +497,7 @@ pub fn flash_attention(
     causal: bool,
 ) -> Result<Option<Tensor>> {
     #[cfg(feature = "cuda")]
-    if !flash_attention_disabled()
-        && q.device().is_cuda()
+    if q.device().is_cuda()
         && flash_attention_dtype_supported(q.dtype())
         && k.dtype() == q.dtype()
         && v.dtype() == q.dtype()
@@ -515,6 +513,63 @@ pub fn flash_attention(
 
     let _ = (q, k, v, scale, causal);
     Ok(None)
+}
+
+/// Request-local reuse for HPD's eager verification/decode masks. Entries are
+/// immutable and keyed by exact logical lengths, dtype and device, so cache
+/// forks and rollbacks need no invalidation. Never pass these masks to an
+/// otherwise unmasked flash/Metal path: an explicit mask changes dispatch.
+pub(crate) struct CausalMaskCache {
+    entries: VecDeque<Tensor>,
+    bytes: usize,
+    max_bytes: usize,
+    max_entries: usize,
+}
+
+impl Default for CausalMaskCache {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+            max_bytes: 32 * 1024 * 1024,
+            max_entries: 64,
+        }
+    }
+}
+
+impl CausalMaskCache {
+    pub(crate) fn get(
+        &mut self,
+        query_len: usize,
+        kv_len: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        if let Some(mask) = self.entries.iter().find(|mask| {
+            mask.dims() == [1, 1, query_len, kv_len]
+                && mask.dtype() == dtype
+                && mask.device().same_device(device)
+        }) {
+            return Ok(mask.clone());
+        }
+        // Use exactly the uncached integer comparison and dtype conversion.
+        // In particular, do not compare positions in BF16 or skip the zero
+        // mask for a one-token query.
+        let mask = create_causal_mask(query_len, kv_len, dtype, device)?;
+        let bytes = mask.elem_count() * dtype.size_in_bytes();
+        if bytes <= self.max_bytes && self.max_entries != 0 {
+            while self.entries.len() >= self.max_entries || self.bytes + bytes > self.max_bytes {
+                let old = self
+                    .entries
+                    .pop_front()
+                    .expect("cache has an entry to evict");
+                self.bytes -= old.elem_count() * old.dtype().size_in_bytes();
+            }
+            self.entries.push_back(mask.clone());
+            self.bytes += bytes;
+        }
+        Ok(mask)
+    }
 }
 
 /// Create a causal (lower-triangular) attention mask.
@@ -646,7 +701,7 @@ pub(crate) fn decode_position_buffer(positions: &[i64], axes: usize) -> Vec<i64>
 /// F16 tops out at 65504, so the value used for wider dtypes saturates to -inf
 /// there — which is exactly the all-masked-row NaN a finite fill exists to
 /// avoid. Staying well inside the range also keeps `score + fill` finite.
-fn masked_score(dtype: DType) -> f64 {
+pub(crate) fn masked_score(dtype: DType) -> f64 {
     match dtype {
         DType::F16 => -1e4,
         _ => -1e9,
@@ -659,6 +714,9 @@ fn masked_score(dtype: DType) -> f64 {
 /// Returns a `(batch, 1, 1, max_len)` mask where left-padded positions
 /// (`j < max_len - seq_len`) are strongly negative and valid positions are `0`.
 /// With `seq_lens = [3, 5]` and `max_len = 5`, item 0 is `[m, m, 0, 0, 0]`.
+///
+/// Every `seq_lens` entry must be `<= max_len`; a longer entry is an error
+/// (rather than silently being treated as unpadded).
 pub fn create_left_padding_mask(
     seq_lens: &[usize],
     max_len: usize,
@@ -666,24 +724,31 @@ pub fn create_left_padding_mask(
     device: &Device,
 ) -> Result<Tensor> {
     let batch_size = seq_lens.len();
+    if let Some(&len) = seq_lens.iter().find(|&&len| len > max_len) {
+        candle_core::bail!(
+            "create_left_padding_mask: sequence length {len} exceeds max_len {max_len}"
+        );
+    }
 
     on_compute_device(device, |compute_device| {
-        // pad_len = max_len - len
-        // lens: (B, 1, 1, 1)
-        let lens_tensor = Tensor::from_vec(
-            seq_lens.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+        // Keep the comparison in integer space, like the causal mask: BF16
+        // cannot represent ~1500-scale lengths exactly (8-bit mantissa), so
+        // computing `max_len - len` in the mask dtype rounds pad lengths by
+        // up to ±16 positions and spuriously masks real prefix tokens of
+        // unequal-length batches.
+        // pad_len: (B, 1, 1, 1), already the difference in u32.
+        let pad_len = Tensor::from_vec(
+            seq_lens
+                .iter()
+                .map(|&len| max_len.saturating_sub(len) as u32)
+                .collect::<Vec<_>>(),
             (batch_size, 1, 1, 1),
             compute_device,
-        )?
-        .to_dtype(dtype)?;
-
-        let max_len_t = Tensor::new(max_len as u32, compute_device)?.to_dtype(dtype)?;
-        let pad_len = max_len_t.broadcast_sub(&lens_tensor)?; // (B, 1, 1, 1)
+        )?;
 
         // pos: (1, 1, 1, max_len)
-        let pos_tensor = Tensor::arange(0u32, max_len as u32, compute_device)?
-            .reshape((1, 1, 1, max_len))?
-            .to_dtype(dtype)?;
+        let pos_tensor =
+            Tensor::arange(0u32, max_len as u32, compute_device)?.reshape((1, 1, 1, max_len))?;
 
         // Mask: pos < pad_len -> suppressed, else 0
         let mask_cond = pos_tensor.broadcast_lt(&pad_len)?;
@@ -709,6 +774,10 @@ pub fn create_left_padding_mask(
 /// token never attends to padding KV (which would corrupt unequal-length
 /// batches). Returns a `(batch, 1, 1, kv_len)` additive mask (`0` attendable, a
 /// large negative for padding); a no-op when there is no padding.
+///
+/// Every `pad_lens` entry must be `< kv_len`: `kv_len` includes the current
+/// token, so `pad_len >= kv_len` would mask every position of the row and
+/// degenerate the softmax to NaN — an error, not a mask.
 pub fn create_generation_mask(
     pad_lens: &[usize],
     kv_len: usize,
@@ -716,20 +785,25 @@ pub fn create_generation_mask(
     device: &Device,
 ) -> Result<Tensor> {
     let batch_size = pad_lens.len();
+    if let Some(&pad) = pad_lens.iter().find(|&&pad| pad >= kv_len) {
+        candle_core::bail!(
+            "create_generation_mask: pad_len {pad} leaves no attendable position in kv_len {kv_len}"
+        );
+    }
 
     on_compute_device(device, |compute_device| {
+        // Integer-space comparison, matching `create_left_padding_mask`:
+        // float dtypes round kv-scale positions and shift the mask.
         // pad_lens as tensor: (batch, 1, 1, 1)
         let pad_lens_tensor = Tensor::from_vec(
             pad_lens.iter().map(|&x| x as u32).collect::<Vec<_>>(),
             (batch_size, 1, 1, 1),
             compute_device,
-        )?
-        .to_dtype(dtype)?;
+        )?;
 
         // Position indices: (1, 1, 1, kv_len)
-        let pos_tensor = Tensor::arange(0u32, kv_len as u32, compute_device)?
-            .reshape((1, 1, 1, kv_len))?
-            .to_dtype(dtype)?;
+        let pos_tensor =
+            Tensor::arange(0u32, kv_len as u32, compute_device)?.reshape((1, 1, 1, kv_len))?;
 
         // Mask condition: pos < pad_len -> masked (large negative value)
         let mask_cond = pos_tensor.broadcast_lt(&pad_lens_tensor)?;
@@ -761,6 +835,58 @@ pub(crate) fn create_generation_mask_if_needed(
         Ok(None)
     } else {
         create_generation_mask(pad_lens, kv_len, dtype, device).map(Some)
+    }
+}
+
+/// Request-local decode mask: padding stays fixed while attendable KV grows.
+/// The backing tensor grows geometrically; each step only takes a logical view.
+/// Eager attention broadcasts that strided view directly, without repacking it.
+pub(crate) struct GenerationMask {
+    pad_lens: Vec<usize>,
+    dtype: DType,
+    device: Device,
+    storage: Option<Tensor>,
+    capacity: usize,
+}
+
+impl GenerationMask {
+    pub(crate) fn new(pad_lens: Vec<usize>, dtype: DType, device: &Device) -> Self {
+        Self {
+            pad_lens,
+            dtype,
+            device: device.clone(),
+            storage: None,
+            capacity: 0,
+        }
+    }
+
+    pub(crate) fn view(&mut self, kv_len: usize) -> Result<Option<Tensor>> {
+        if self.pad_lens.iter().all(|&pad| pad == 0) {
+            return Ok(None);
+        }
+        // Validate the logical length, not the larger backing allocation.
+        if let Some(&pad) = self.pad_lens.iter().find(|&&pad| pad >= kv_len) {
+            candle_core::bail!(
+                "create_generation_mask: pad_len {pad} leaves no attendable position in kv_len {kv_len}"
+            );
+        }
+        if kv_len > self.capacity {
+            let capacity = kv_len
+                .checked_next_power_of_two()
+                .filter(|&n| n <= u32::MAX as usize)
+                .unwrap_or(kv_len);
+            // Preserve the integer comparison and dtype casts of the original
+            // mask builder; every newly available key is already zero-filled.
+            let storage =
+                create_generation_mask(&self.pad_lens, capacity, self.dtype, &self.device)?;
+            self.storage = Some(storage);
+            self.capacity = capacity;
+        }
+        self.storage
+            .as_ref()
+            .expect("allocated decode mask")
+            .narrow(D::Minus1, 0, kv_len)
+            .map(Some)
     }
 }
 
@@ -1062,6 +1188,132 @@ pub fn select_rope_sections(
 mod tests {
     use super::*;
 
+    fn check_gqa_cache_views(device: &Device, dtype: DType) -> Result<()> {
+        let (batch, groups, len, cap, dim) = (2, 3, 7, 13, 16);
+        let tensor = |shape: (usize, usize, usize, usize), seed: usize| {
+            let values = (0..shape.0 * shape.1 * shape.2 * shape.3)
+                .map(|i| ((i * 37 + seed) % 101) as f32 / 51.0 - 1.0)
+                .collect::<Vec<_>>();
+            Tensor::from_vec(values, shape, device)?.to_dtype(dtype)
+        };
+        for heads in [1, 2, 4] {
+            for queries in [1, 3] {
+                let q = tensor((batch, heads * groups, queries, dim), 7)?;
+                let k = tensor((batch, heads, cap, dim), 19)?.narrow(2, 0, len)?;
+                let v = tensor((batch, heads, cap, dim), 43)?.narrow(2, 0, len)?;
+                // Also preserve support for public callers with nonuniform
+                // outer strides (the two outer axes both have length two).
+                let (k, v) = if heads == 2 && queries == 3 {
+                    (k.transpose(0, 1)?, v.transpose(0, 1)?)
+                } else {
+                    (k, v)
+                };
+                assert!(!k.is_contiguous());
+                let mask = create_causal_mask(queries, len, dtype, device)?;
+                for mask in [None, Some(&mask)] {
+                    // Original eager path: reshape copies narrow KV views.
+                    let old_q = q.reshape((batch * heads, groups * queries, dim))?;
+                    let old_k = k.reshape((batch * heads, len, dim))?.transpose(1, 2)?;
+                    let scores = (old_q.matmul(&old_k)? * 0.25)?.reshape((
+                        batch,
+                        heads * groups,
+                        queries,
+                        len,
+                    ))?;
+                    let scores = match mask {
+                        Some(mask) => scores.broadcast_add(mask)?,
+                        None => scores,
+                    };
+                    let weights = candle_nn::ops::softmax_last_dim(&scores.to_dtype(DType::F32)?)?
+                        .to_dtype(dtype)?
+                        .reshape((batch * heads, groups * queries, len))?;
+                    let expected = weights.matmul(&v.reshape((batch * heads, len, dim))?)?;
+                    let actual =
+                        scaled_dot_product_attention_gqa(&q, &k, &v, mask, 0.25, false, groups)?;
+                    let bits = |t: Tensor| -> Result<Vec<u32>> {
+                        Ok(t.to_dtype(DType::F32)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect())
+                    };
+                    assert_eq!(
+                        bits(actual)?,
+                        bits(expected)?,
+                        "dtype={dtype:?}, heads={heads}, queries={queries}, masked={}",
+                        mask.is_some()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gqa_cache_views_match_flattened_history_bits() -> Result<()> {
+        check_gqa_cache_views(&Device::Cpu, DType::F32)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_gqa_cache_views_match_flattened_history_bits() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        check_gqa_cache_views(&device, DType::F32)?;
+        check_gqa_cache_views(&device, DType::BF16)
+    }
+
+    #[test]
+    fn padding_masks_mark_exactly_the_padded_prefix_in_bf16() -> Result<()> {
+        // Regression: computing `max_len - len` in the mask dtype rounds
+        // ~1500-scale lengths in BF16 by up to ±16 positions and masks real
+        // prefix tokens. The comparison must stay in integer space.
+        let device = Device::Cpu;
+        let seq_lens = [1493usize, 1417, 1325];
+        let max_len = *seq_lens.iter().max().unwrap();
+
+        let padding = create_left_padding_mask(&seq_lens, max_len, DType::BF16, &device)?;
+        let values = padding
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(values.len(), seq_lens.len() * max_len);
+        for (row, &len) in seq_lens.iter().enumerate() {
+            let pad_len = max_len - len;
+            let row_values = &values[row * max_len..(row + 1) * max_len];
+            for (position, &value) in row_values.iter().enumerate() {
+                let masked = value < 0.0;
+                assert_eq!(
+                    masked,
+                    position < pad_len,
+                    "row {row} position {position} (pad_len {pad_len})"
+                );
+            }
+        }
+
+        let decode_pad_lens: Vec<usize> = seq_lens.iter().map(|&len| max_len - len).collect();
+        let decode = create_generation_mask(&decode_pad_lens, max_len + 64, DType::BF16, &device)?;
+        let decode_values = decode
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (row, &len) in seq_lens.iter().enumerate() {
+            let pad_len = max_len - len;
+            let row_values = &decode_values[row * (max_len + 64)..(row + 1) * (max_len + 64)];
+            for (position, &value) in row_values.iter().enumerate() {
+                let masked = value < 0.0;
+                assert_eq!(
+                    masked,
+                    position < pad_len,
+                    "decode row {row} position {position} (pad_len {pad_len})"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn flash_attention_rejects_unsupported_dtypes() {
         assert!(flash_attention_dtype_supported(DType::F16));
@@ -1345,6 +1597,29 @@ mod tests {
             true,
             2,
         )?;
+        let mask = CausalMaskCache::default().get(3, 8, DType::F32, &device)?;
+        let cached = segmented_scaled_dot_product_attention_gqa(
+            &q,
+            &[(&prefix_k, &prefix_v), (&tail_k, &tail_v)],
+            Some(&mask),
+            scale,
+            true,
+            2,
+        )?;
+        assert_eq!(
+            cached
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            segmented
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
         let contiguous = contiguous.flatten_all()?.to_vec1::<f32>()?;
         let segmented = segmented.flatten_all()?.to_vec1::<f32>()?;
         assert!(
@@ -1373,6 +1648,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("expected 8 across all segments"));
+        Ok(())
+    }
+
+    #[test]
+    fn causal_mask_cache_handles_forks_trims_dtypes_and_eviction() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cache = CausalMaskCache {
+            max_bytes: 4096,
+            max_entries: 2,
+            ..Default::default()
+        };
+        for (q, kv, dtype) in [
+            (3, 257, DType::F32),
+            (3, 258, DType::F32),
+            (1, 9, DType::F32),
+            (3, 258, DType::BF16),
+            (1, 8, DType::F32),
+            (3, 257, DType::F32),
+            (3, 1000, DType::F32),
+        ] {
+            let mask = cache.get(q, kv, dtype, &device)?;
+            let values = mask.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(values.len(), q * kv);
+            for (i, value) in values.iter().enumerate() {
+                let expected = if i % kv <= kv - q + i / kv {
+                    0f32
+                } else {
+                    f32::NEG_INFINITY
+                };
+                assert_eq!(value.to_bits(), expected.to_bits());
+            }
+            if q * kv * dtype.size_in_bytes() <= cache.max_bytes {
+                assert_eq!(mask.id(), cache.get(q, kv, dtype, &device)?.id());
+            }
+            assert!(cache.entries.len() <= 2 && cache.bytes <= 4096);
+        }
+        assert!(cache.get(4, 3, DType::F32, &device).is_err());
         Ok(())
     }
 
@@ -1526,13 +1838,59 @@ mod tests {
     }
 
     #[test]
-    fn generation_mask_is_omitted_for_equal_length_batch() -> Result<()> {
+    fn generation_mask_growth_matches_per_step_mask() -> Result<()> {
         let device = Device::Cpu;
-        assert!(create_generation_mask_if_needed(&[0, 0, 0], 32, DType::F32, &device)?.is_none());
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let mut equal = GenerationMask::new(vec![0, 0, 0], dtype, &device);
+            assert!(equal.view(32)?.is_none());
+            let mut mask = GenerationMask::new(vec![3, 0, 1], dtype, &device);
+            for kv_len in [4, 7, 8, 9, 16, 17, 2049] {
+                let previous = mask.storage.as_ref().map(Tensor::id);
+                let capacity = mask.capacity;
+                let actual = mask.view(kv_len)?.expect("unequal prompts need a mask");
+                let expected = create_generation_mask(&[3, 0, 1], kv_len, dtype, &device)?;
+                assert_eq!(actual.dims(), expected.dims());
+                let bits = |tensor: &Tensor| -> Result<Vec<u32>> {
+                    Ok(tensor
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect())
+                };
+                assert_eq!(bits(&actual)?, bits(&expected)?, "{dtype:?}, {kv_len}");
+                if kv_len <= capacity {
+                    assert_eq!(mask.storage.as_ref().map(Tensor::id), previous);
+                }
+            }
+        }
+        Ok(())
+    }
 
-        let mask = create_generation_mask_if_needed(&[3, 0, 1], 32, DType::F32, &device)?
-            .expect("unequal prompts need a padding mask");
-        assert_eq!(mask.dims(), &[3, 1, 1, 32]);
+    #[test]
+    fn padding_masks_reject_overlong_inputs() -> Result<()> {
+        let device = Device::Cpu;
+        // A sequence longer than max_len must be an error, not a silent
+        // "no padding" row.
+        assert!(create_left_padding_mask(&[3, 7], 5, DType::F32, &device).is_err());
+        // A pad wider than the KV length would mask every position.
+        assert!(create_generation_mask(&[2, 9], 5, DType::F32, &device).is_err());
+        // Boundary values stay legal and unchanged.
+        let mask = create_left_padding_mask(&[5], 5, DType::F32, &device)?;
+        assert!(
+            mask.flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .all(|&v| v == 0.0)
+        );
+        // pad_len == kv_len would also mask the current token (kv_len
+        // includes it) — the same NaN degeneracy, also rejected.
+        assert!(create_generation_mask(&[5], 5, DType::F32, &device).is_err());
+        let mask = create_generation_mask(&[2], 5, DType::F32, &device)?;
+        let row = mask.flatten_all()?.to_vec1::<f32>()?;
+        assert!(row[0] < -1e8 && row[1] < -1e8);
+        assert_eq!(&row[2..], &[0.0, 0.0, 0.0]);
         Ok(())
     }
 
@@ -1577,7 +1935,7 @@ mod tests {
     ///
     /// F16 caps at 65504, so a fill chosen for wider dtypes saturates to -inf
     /// there and reintroduces the all-masked-row NaN. F16 is reachable via
-    /// `OAR_VL_DTYPE=f16` and via `select_dtype`'s fallback on CUDA devices
+    /// `RuntimeConfig::with_dtype` and via `select_dtype`'s fallback on CUDA devices
     /// without BF16 kernels.
     #[test]
     fn padding_mask_is_finite_in_every_dtype() -> Result<()> {

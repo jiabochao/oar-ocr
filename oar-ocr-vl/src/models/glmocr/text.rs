@@ -8,8 +8,8 @@ use crate::runtime::cuda::dynamic_kv::DynamicKvAppend;
 use crate::runtime::decoder_graph::decoder_cache_capacity;
 #[cfg(feature = "cuda")]
 use crate::runtime::decoder_graph::{
-    CudaGraphDrainGuard, CudaGraphKvLengths, SingleTokenDecoderCudaGraph, cuda_graph_error,
-    decoder_attention_is_causal, drop_and_drain, report_stashed_cuda_error, sync_graph_tensor,
+    CudaGraphDrainGuard, CudaGraphInputs, CudaGraphKvLengths, DecoderCudaGraph,
+    capture_decoder_graph, cuda_graph_error, decoder_attention_is_causal,
 };
 use crate::utils::{candle_to_ocr_inference, candle_to_ocr_processing};
 use candle_core::{D, DType, Device, IndexOp, Tensor};
@@ -84,12 +84,8 @@ fn rotate_half_interleaved(x: &Tensor) -> Result<Tensor, Error> {
     })
 }
 
-pub(super) fn apply_rotary_pos_emb(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-) -> Result<(Tensor, Tensor), Error> {
+// Position-dependent interleaving is shared by all target layers and MTP.
+fn interleave_rotary(cos: &Tensor, sin: &Tensor) -> Result<(Tensor, Tensor), Error> {
     let cos = cos.unsqueeze(1).map_err(|e| {
         candle_to_ocr_processing(
             crate::error::ProcessingStage::TensorOperation,
@@ -160,6 +156,23 @@ pub(super) fn apply_rotary_pos_emb(
             )
         })?;
 
+    Ok((cos, sin))
+}
+
+pub(super) fn apply_rotary_pos_emb(
+    q: &Tensor,
+    k: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<(Tensor, Tensor), Error> {
+    let rot_dim = cos.dim(D::Minus1).map_err(|e| {
+        candle_to_ocr_processing(
+            crate::error::ProcessingStage::TensorOperation,
+            "GLM-OCR: prepared rotary dimension",
+            e,
+        )
+    })?;
+
     let head_dim = q.dim(D::Minus1).map_err(|e| {
         candle_to_ocr_processing(
             crate::error::ProcessingStage::TensorOperation,
@@ -186,14 +199,14 @@ pub(super) fn apply_rotary_pos_emb(
     let q_rotated = rotate_half_interleaved(&q_rot)?;
     let k_rotated = rotate_half_interleaved(&k_rot)?;
 
-    let q_mul = q_rot.broadcast_mul(&cos).map_err(|e| {
+    let q_mul = q_rot.broadcast_mul(cos).map_err(|e| {
         candle_to_ocr_processing(
             crate::error::ProcessingStage::TensorOperation,
             "GLM-OCR: q*cos",
             e,
         )
     })?;
-    let q_rot_mul = q_rotated.broadcast_mul(&sin).map_err(|e| {
+    let q_rot_mul = q_rotated.broadcast_mul(sin).map_err(|e| {
         candle_to_ocr_processing(
             crate::error::ProcessingStage::TensorOperation,
             "GLM-OCR: rotate_half(q)*sin",
@@ -208,14 +221,14 @@ pub(super) fn apply_rotary_pos_emb(
         )
     })?;
 
-    let k_mul = k_rot.broadcast_mul(&cos).map_err(|e| {
+    let k_mul = k_rot.broadcast_mul(cos).map_err(|e| {
         candle_to_ocr_processing(
             crate::error::ProcessingStage::TensorOperation,
             "GLM-OCR: k*cos",
             e,
         )
     })?;
-    let k_rot_mul = k_rotated.broadcast_mul(&sin).map_err(|e| {
+    let k_rot_mul = k_rotated.broadcast_mul(sin).map_err(|e| {
         candle_to_ocr_processing(
             crate::error::ProcessingStage::TensorOperation,
             "GLM-OCR: rotate_half(k)*sin",
@@ -456,7 +469,7 @@ impl GlmOcrTextRotaryEmbedding {
                 e,
             )
         })?;
-        Ok((cos, sin))
+        interleave_rotary(&cos, &sin)
     }
 }
 
@@ -1061,64 +1074,14 @@ impl GlmOcrTextDecoderLayer {
     }
 }
 
-#[cfg(feature = "cuda")]
-struct GlmVerificationCudaGraph {
-    // The graph owns device pointers into all tensors below; dispose via
-    // `dispose` so capture-touched buffers are never returned to the
-    // stream-ordered allocator (see SingleTokenDecoderCudaGraph::dispose).
-    graph: candle_core::cuda_backend::cudarc::driver::CudaGraph,
-    hidden_input: Tensor,
-    position_input: Tensor,
-    _query_lengths: Tensor,
-    kv_lengths: CudaGraphKvLengths,
-    hidden_output: Tensor,
-    token_output: Tensor,
-    cache_len: usize,
-    query_len: usize,
-}
-
-#[cfg(feature = "cuda")]
-impl GlmVerificationCudaGraph {
-    fn dispose(self) {
-        let Self {
-            graph,
-            hidden_input,
-            position_input,
-            _query_lengths,
-            kv_lengths,
-            hidden_output,
-            token_output,
-            cache_len: _,
-            query_len: _,
-        } = self;
-        let device = hidden_input.device().clone();
-        report_stashed_cuda_error(&device, "CUDA graph disposal");
-        drop_and_drain(graph, &device);
-        drop_and_drain(token_output, &device);
-        drop_and_drain(hidden_output, &device);
-        drop_and_drain(kv_lengths, &device);
-        drop_and_drain(_query_lengths, &device);
-        drop_and_drain(position_input, &device);
-        drop_and_drain(hidden_input, &device);
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl std::fmt::Debug for GlmVerificationCudaGraph {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GlmVerificationCudaGraph")
-            .field("query_len", &self.query_len)
-            .field("cache_len", &self.cache_len)
-            .finish_non_exhaustive()
-    }
-}
-
 #[derive(Debug)]
 pub struct GlmOcrTextModel {
     #[cfg(feature = "cuda")]
-    decode_graph: RefCell<Option<SingleTokenDecoderCudaGraph>>,
+    cuda_graphs: bool,
     #[cfg(feature = "cuda")]
-    verification_graph: RefCell<Option<GlmVerificationCudaGraph>>,
+    decode_graph: RefCell<Option<DecoderCudaGraph<CudaGraphInputs>>>,
+    #[cfg(feature = "cuda")]
+    verification_graph: RefCell<Option<DecoderCudaGraph<CudaGraphInputs>>>,
     embed_tokens: Embedding,
     layers: Vec<GlmOcrTextDecoderLayer>,
     norm: RmsNorm,
@@ -1130,6 +1093,18 @@ pub struct GlmOcrTextModel {
 }
 
 impl GlmOcrTextModel {
+    pub(crate) fn set_cuda_graphs(&mut self, enabled: bool) {
+        #[cfg(feature = "cuda")]
+        {
+            self.cuda_graphs = enabled;
+            if !enabled {
+                self.invalidate_cuda_graph();
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = enabled;
+    }
+
     pub fn load(cfg: &GlmOcrTextConfig, vb: VarBuilder) -> Result<Self, Error> {
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))
             .map_err(|e| candle_to_ocr_inference("GLM-OCR", "text embed_tokens", e))?;
@@ -1146,6 +1121,8 @@ impl GlmOcrTextModel {
         #[cfg(feature = "cuda")]
         let _drain_guard = CudaGraphDrainGuard::new(vb.device());
         Ok(Self {
+            #[cfg(feature = "cuda")]
+            cuda_graphs: true,
             #[cfg(feature = "cuda")]
             decode_graph: RefCell::new(None),
             #[cfg(feature = "cuda")]
@@ -1285,9 +1262,8 @@ impl GlmOcrTextModel {
         max_new_tokens: usize,
         lm_head: &Linear,
     ) -> Result<(), Error> {
-        if std::env::var_os("OAR_VL_DISABLE_CUDA_GRAPH").is_some()
-            || std::env::var_os("OAR_GLMOCR_DISABLE_CUDA_GRAPH").is_some()
-        {
+        #[cfg(feature = "cuda")]
+        if !self.cuda_graphs {
             #[cfg(feature = "cuda")]
             self.invalidate_cuda_graph();
             return Ok(());
@@ -1332,10 +1308,7 @@ impl GlmOcrTextModel {
         query_len: usize,
         lm_head: &Linear,
     ) -> Result<Option<usize>, Error> {
-        if query_len == 0
-            || std::env::var_os("OAR_VL_DISABLE_CUDA_GRAPH").is_some()
-            || std::env::var_os("OAR_GLMOCR_DISABLE_CUDA_GRAPH").is_some()
-        {
+        if query_len == 0 || !self.cuda_graphs {
             self.invalidate_cuda_graph();
             return Ok(None);
         }
@@ -1365,7 +1338,9 @@ impl GlmOcrTextModel {
             .verification_graph
             .borrow()
             .as_ref()
-            .filter(|graph| graph.query_len == query_len && graph.cache_len >= required)
+            .filter(|graph| {
+                graph.inputs.hidden.dims()[1] == query_len && graph.cache_len >= required
+            })
             .map(|graph| graph.cache_len);
         if let Some(retained_cache_len) = retained_cache_len {
             // The MTP graph shares this capacity contract. Returning the newly
@@ -1381,16 +1356,13 @@ impl GlmOcrTextModel {
 
     #[cfg(feature = "cuda")]
     fn capture_cuda_graph(&self, cache_len: usize, lm_head: &Linear) -> Result<(), Error> {
-        use candle_core::cuda_backend::cudarc::driver::sys::{
-            CUgraphInstantiate_flags_enum, CUstreamCaptureMode_enum,
-        };
-
         if self.decode_graph.borrow().is_some() {
             return Ok(());
         }
-        let Device::Cuda(cuda) = self.embed_tokens.embeddings().device() else {
+        let device = self.embed_tokens.embeddings().device();
+        if !device.is_cuda() {
             return Ok(());
-        };
+        }
         let query_len = 1;
         for layer in &self.layers {
             layer
@@ -1403,83 +1375,46 @@ impl GlmOcrTextModel {
             .dim(1)
             .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph hidden size", e))?;
         let device = self.embed_tokens.embeddings().device();
-        let hidden_input = Tensor::zeros(
-            (1, query_len, hidden_size),
-            self.embed_tokens.embeddings().dtype(),
-            device,
-        )
-        .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph hidden input", e))?;
-        let position_input = Tensor::zeros((3, 1, query_len), DType::I64, device)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph position input", e))?;
-        let query_lengths = Tensor::new(&[0u32, query_len as u32], device)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph query lengths", e))?;
-        let kv_lengths = CudaGraphKvLengths::new(query_len, device)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph KV lengths", e))?;
-        let stream = cuda.cuda_stream();
-        let _htod_cache = cuda.enable_cuda_graph_htod_cache();
-
-        let warm = self.forward_dynamic(
-            &hidden_input,
-            &position_input,
-            &query_lengths,
-            kv_lengths.tensor(),
-        )?;
-        let warm_logits = self.project_logits(&warm, lm_head)?;
-        sync_graph_tensor("GLM-OCR", &warm_logits, "warm decoder CUDA graph")?;
-        // Allocate the output buffer before capture so it belongs to the
-        // regular stream-ordered pool; a capture-time allocation lives in the
-        // graph's private pool and can never be returned to the allocator
-        // safely. Prime the copy so the captured run sees a warm kernel.
-        let logits_output = Tensor::zeros_like(&warm_logits)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph logits output", e))?;
-        logits_output
-            .slice_set(&warm_logits, 0, 0)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "prime graph logits copy", e))?;
-
-        stream
-            .begin_capture(CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_GLOBAL)
-            .map_err(|e| cuda_graph_error("GLM-OCR", "begin decoder CUDA graph capture", e))?;
-        let captured_output: Result<(), Error> = (|| {
-            let hidden = self.forward_dynamic(
-                &hidden_input,
-                &position_input,
-                &query_lengths,
-                kv_lengths.tensor(),
-            )?;
-            let logits = self.project_logits(&hidden, lm_head)?;
-            logits_output
-                .slice_set(&logits, 0, 0)
-                .map_err(|e| candle_to_ocr_inference("GLM-OCR", "record graph logits copy", e))
-        })();
-        if let Err(error) = captured_output {
-            let _ = stream.end_capture(
-                CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-            );
-            return Err(error);
-        }
-        let graph = stream
-            .end_capture(
-                CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        let inputs = CudaGraphInputs {
+            hidden: Tensor::zeros(
+                (1, query_len, hidden_size),
+                self.embed_tokens.embeddings().dtype(),
+                device,
             )
-            .map_err(|e| cuda_graph_error("GLM-OCR", "end decoder CUDA graph capture", e))?
-            .ok_or_else(|| Error::Config {
-                message: "GLM-OCR decoder capture returned no graph".to_string(),
-            })?;
-        graph
-            .launch()
-            .map_err(|e| cuda_graph_error("GLM-OCR", "warm decoder CUDA graph", e))?;
-        sync_graph_tensor("GLM-OCR", &logits_output, "sync decoder CUDA graph")?;
-        self.clear_kv_cache();
-        *self.decode_graph.borrow_mut() = Some(SingleTokenDecoderCudaGraph {
-            graph,
-            hidden_input,
-            position_input,
-            _query_lengths: query_lengths,
-            kv_lengths,
-            logits_output,
+            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph hidden input", e))?,
+            positions: Tensor::zeros((3, 1, query_len), DType::I64, device)
+                .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph position input", e))?,
+            query_lengths: Tensor::new(&[0u32, query_len as u32], device)
+                .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph query lengths", e))?,
+            kv_lengths: CudaGraphKvLengths::new(query_len, device)
+                .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph KV lengths", e))?,
+            lm_head: lm_head.clone(),
+        };
+        let graph = capture_decoder_graph(
+            device,
+            "GLM-OCR",
+            self,
+            inputs,
+            Self::decode_graph_body,
             cache_len,
-        });
+        )?;
+        self.clear_kv_cache();
+        *self.decode_graph.borrow_mut() = Some(graph);
         Ok(())
+    }
+
+    /// The captured decode step: a bare `fn` so the captured region can
+    /// only read model-owned weights and the registered inputs.
+    #[cfg(feature = "cuda")]
+    fn decode_graph_body(this: &Self, inputs: &CudaGraphInputs) -> Result<Vec<Tensor>, Error> {
+        let hidden = this.forward_dynamic(
+            &inputs.hidden,
+            &inputs.positions,
+            &inputs.query_lengths,
+            inputs.kv_lengths.tensor(),
+        )?;
+        let logits = this.project_logits(&hidden, &inputs.lm_head)?;
+        Ok(vec![logits])
     }
 
     #[cfg(feature = "cuda")]
@@ -1489,13 +1424,10 @@ impl GlmOcrTextModel {
         query_len: usize,
         lm_head: &Linear,
     ) -> Result<(), Error> {
-        use candle_core::cuda_backend::cudarc::driver::sys::{
-            CUgraphInstantiate_flags_enum, CUstreamCaptureMode_enum,
-        };
-
-        let Device::Cuda(cuda) = self.embed_tokens.embeddings().device() else {
+        let device = self.embed_tokens.embeddings().device();
+        if !device.is_cuda() {
             return Ok(());
-        };
+        }
         for layer in &self.layers {
             layer.prepare_dynamic_cache(query_len, cache_len)?;
         }
@@ -1505,101 +1437,52 @@ impl GlmOcrTextModel {
             .dim(1)
             .map_err(|e| candle_to_ocr_inference("GLM-OCR", "graph hidden size", e))?;
         let device = self.embed_tokens.embeddings().device();
-        let hidden_input = Tensor::zeros(
-            (1, query_len, hidden_size),
-            self.embed_tokens.embeddings().dtype(),
-            device,
-        )
-        .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification graph input", e))?;
-        let position_input = Tensor::zeros((3, 1, query_len), DType::I64, device)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification graph positions", e))?;
-        let query_lengths = Tensor::new(&[0u32, query_len as u32], device)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification query lengths", e))?;
-        let kv_lengths = CudaGraphKvLengths::new(query_len, device)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification KV lengths", e))?;
-        let stream = cuda.cuda_stream();
-        let _htod_cache = cuda.enable_cuda_graph_htod_cache();
-
-        let warm = self.forward_dynamic(
-            &hidden_input,
-            &position_input,
-            &query_lengths,
-            kv_lengths.tensor(),
-        )?;
-        let warm_tokens = self
-            .project_all_logits(&warm, lm_head)?
-            .argmax(D::Minus1)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "warm verification argmax", e))?;
-        sync_graph_tensor("GLM-OCR", &warm_tokens, "warm verification CUDA graph")?;
-        // Allocate the output buffers before capture so they belong to the
-        // regular stream-ordered pool; a capture-time allocation lives in the
-        // graph's private pool and can never be returned to the allocator
-        // safely. Prime the copies so the captured run sees warm kernels.
-        let hidden_output = Tensor::zeros_like(&warm)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification hidden output", e))?;
-        let token_output = Tensor::zeros_like(&warm_tokens)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification token output", e))?;
-        hidden_output
-            .slice_set(&warm, 0, 0)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "prime verification hidden copy", e))?;
-        token_output
-            .slice_set(&warm_tokens, 0, 0)
-            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "prime verification token copy", e))?;
-
-        stream
-            .begin_capture(CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_GLOBAL)
-            .map_err(|e| cuda_graph_error("GLM-OCR", "begin verification graph capture", e))?;
-        let captured_output: Result<(), Error> = (|| {
-            let hidden = self.forward_dynamic(
-                &hidden_input,
-                &position_input,
-                &query_lengths,
-                kv_lengths.tensor(),
-            )?;
-            let tokens = self
-                .project_all_logits(&hidden, lm_head)?
-                .argmax(D::Minus1)
-                .map_err(|e| {
-                    candle_to_ocr_inference("GLM-OCR", "captured verification argmax", e)
-                })?;
-            hidden_output.slice_set(&hidden, 0, 0).map_err(|e| {
-                candle_to_ocr_inference("GLM-OCR", "record verification hidden copy", e)
-            })?;
-            token_output.slice_set(&tokens, 0, 0).map_err(|e| {
-                candle_to_ocr_inference("GLM-OCR", "record verification token copy", e)
-            })
-        })();
-        if let Err(error) = captured_output {
-            let _ = stream.end_capture(
-                CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
-            );
-            return Err(error);
-        }
-        let graph = stream
-            .end_capture(
-                CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        let inputs = CudaGraphInputs {
+            hidden: Tensor::zeros(
+                (1, query_len, hidden_size),
+                self.embed_tokens.embeddings().dtype(),
+                device,
             )
-            .map_err(|e| cuda_graph_error("GLM-OCR", "end verification graph capture", e))?
-            .ok_or_else(|| Error::Config {
-                message: "GLM-OCR verification capture returned no graph".to_string(),
-            })?;
-        graph
-            .launch()
-            .map_err(|e| cuda_graph_error("GLM-OCR", "warm verification CUDA graph", e))?;
-        sync_graph_tensor("GLM-OCR", &token_output, "sync verification CUDA graph")?;
-        self.clear_kv_cache();
-        *self.verification_graph.borrow_mut() = Some(GlmVerificationCudaGraph {
-            graph,
-            hidden_input,
-            position_input,
-            _query_lengths: query_lengths,
-            kv_lengths,
-            hidden_output,
-            token_output,
+            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification graph input", e))?,
+            positions: Tensor::zeros((3, 1, query_len), DType::I64, device)
+                .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification positions", e))?,
+            query_lengths: Tensor::new(&[0u32, query_len as u32], device)
+                .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification query lengths", e))?,
+            kv_lengths: CudaGraphKvLengths::new(query_len, device)
+                .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification KV lengths", e))?,
+            lm_head: lm_head.clone(),
+        };
+        let graph = capture_decoder_graph(
+            device,
+            "GLM-OCR",
+            self,
+            inputs,
+            Self::verification_graph_body,
             cache_len,
-            query_len,
-        });
+        )?;
+        self.clear_kv_cache();
+        *self.verification_graph.borrow_mut() = Some(graph);
         Ok(())
+    }
+
+    /// The captured verification step: hidden states plus the greedy token
+    /// per position, as a bare `fn` over the registered inputs.
+    #[cfg(feature = "cuda")]
+    fn verification_graph_body(
+        this: &Self,
+        inputs: &CudaGraphInputs,
+    ) -> Result<Vec<Tensor>, Error> {
+        let hidden = this.forward_dynamic(
+            &inputs.hidden,
+            &inputs.positions,
+            &inputs.query_lengths,
+            inputs.kv_lengths.tensor(),
+        )?;
+        let tokens = this
+            .project_all_logits(&hidden, &inputs.lm_head)?
+            .argmax(D::Minus1)
+            .map_err(|e| candle_to_ocr_inference("GLM-OCR", "verification argmax", e))?;
+        Ok(vec![hidden, tokens])
     }
 
     #[cfg(feature = "cuda")]
@@ -1618,20 +1501,23 @@ impl GlmOcrTextModel {
             self.invalidate_cuda_graph();
             return Ok(None);
         }
-        if inputs_embeds.shape() != captured.hidden_input.shape()
-            || position_ids.shape() != captured.position_input.shape()
+        if inputs_embeds.shape() != captured.inputs.hidden.shape()
+            || position_ids.shape() != captured.inputs.positions.shape()
         {
             return Ok(None);
         }
         captured
-            .hidden_input
+            .inputs
+            .hidden
             .slice_set(inputs_embeds, 0, 0)
             .map_err(|e| candle_to_ocr_inference("GLM-OCR", "copy graph hidden", e))?;
         captured
-            .position_input
+            .inputs
+            .positions
             .slice_set(position_ids, 0, 0)
             .map_err(|e| candle_to_ocr_inference("GLM-OCR", "copy graph positions", e))?;
         captured
+            .inputs
             .kv_lengths
             .update(kv_len)
             .map_err(|e| candle_to_ocr_inference("GLM-OCR", "update graph KV lengths", e))?;
@@ -1642,7 +1528,7 @@ impl GlmOcrTextModel {
         for layer in &self.layers {
             layer.set_kv_cache_len(kv_len)?;
         }
-        Ok(Some(captured.logits_output.clone()))
+        Ok(Some(captured.outputs[0].clone()))
     }
 
     #[cfg(feature = "cuda")]
@@ -1661,20 +1547,23 @@ impl GlmOcrTextModel {
             self.invalidate_cuda_graph();
             return Ok(None);
         }
-        if inputs_embeds.shape() != captured.hidden_input.shape()
-            || position_ids.shape() != captured.position_input.shape()
+        if inputs_embeds.shape() != captured.inputs.hidden.shape()
+            || position_ids.shape() != captured.inputs.positions.shape()
         {
             return Ok(None);
         }
         captured
-            .hidden_input
+            .inputs
+            .hidden
             .slice_set(inputs_embeds, 0, 0)
             .map_err(|e| candle_to_ocr_inference("GLM-OCR", "copy verification hidden", e))?;
         captured
-            .position_input
+            .inputs
+            .positions
             .slice_set(position_ids, 0, 0)
             .map_err(|e| candle_to_ocr_inference("GLM-OCR", "copy verification positions", e))?;
         captured
+            .inputs
             .kv_lengths
             .update(kv_len)
             .map_err(|e| candle_to_ocr_inference("GLM-OCR", "update verification KV lengths", e))?;
@@ -1686,8 +1575,8 @@ impl GlmOcrTextModel {
             layer.set_kv_cache_len(kv_len)?;
         }
         Ok(Some((
-            captured.hidden_output.clone(),
-            captured.token_output.clone(),
+            captured.outputs[0].clone(),
+            captured.outputs[1].clone(),
         )))
     }
 

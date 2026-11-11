@@ -8,10 +8,10 @@
 //! at runtime without `target-cpu=native`. Entry points pick the SIMD path when
 //! the feature is on, else the scalar one.
 //!
-//! The SIMD paths are **bit-identical** to the scalar reference: same
-//! `value * alpha + beta` form (plain multiply-add, *not* FMA, which rounds
-//! differently) and same "last index wins on ties" argmax. Parity tests at the
-//! bottom of the module enforce this, so toggling `simd` never changes output.
+//! Normalization keeps the scalar `value * alpha + beta` form (plain
+//! multiply-add, *not* FMA). Argmax preserves the last winning index and the
+//! existing confidence reduction: SIMD retains the target's max behavior for
+//! NaNs and signed zeros, whereas the scalar fallback uses `Iterator::max_by`.
 //!
 //! [`wide`]: https://docs.rs/wide
 //! [`multiversion`]: https://docs.rs/multiversion
@@ -163,9 +163,9 @@ fn normalize_plane_simd(rgb: &[u8], sc: usize, a: f32, b: f32, dst: &mut [f32]) 
 
     let va = f32x8::splat(a);
     let vb = f32x8::splat(b);
-    let mut chunks = dst.chunks_exact_mut(8);
+    let (chunks, remainder) = dst.as_chunks_mut::<8>();
     let mut p = 0usize;
-    for chunk in &mut chunks {
+    for chunk in chunks {
         let gathered = [
             rgb[p * 3 + sc] as f32,
             rgb[(p + 1) * 3 + sc] as f32,
@@ -177,22 +177,76 @@ fn normalize_plane_simd(rgb: &[u8], sc: usize, a: f32, b: f32, dst: &mut [f32]) 
             rgb[(p + 7) * 3 + sc] as f32,
         ];
         let v = f32x8::new(gathered) * va + vb;
-        chunk.copy_from_slice(&v.to_array());
+        *chunk = v.to_array();
         p += 8;
     }
-    for d in chunks.into_remainder() {
+    for d in remainder {
         *d = rgb[p * 3 + sc] as f32 * a + b;
         p += 1;
     }
 }
 
 #[cfg(feature = "simd")]
+#[multiversion::multiversion(targets("x86_64+avx2+fma", "x86_64+sse4.2", "aarch64+neon"))]
 fn argmax_simd(row: &[f32]) -> Option<(usize, f32)> {
+    use wide::{bytemuck::cast, f32x8, u32x8};
+
     if row.is_empty() {
         return None;
     }
-    // 8-wide max-reduce for the value, then a forward scan keeping the *last*
-    // index equal to it — same tie-breaking as `Iterator::max_by`.
+    // CTC vocabularies fit in u32 lanes. Keep the old path for larger slices
+    // rather than truncating indices or changing exceptional-float behavior.
+    if row.len() > u32::MAX as usize {
+        return argmax_two_pass_simd(row);
+    }
+
+    let mut values = f32x8::splat(f32::NEG_INFINITY);
+    let mut nan_mask = f32x8::splat(0.0);
+    let mut indices = u32x8::splat(0);
+    let mut positions = u32x8::new([0, 1, 2, 3, 4, 5, 6, 7]);
+    let (chunks, remainder) = row.as_chunks::<8>();
+    for chunk in chunks {
+        let next = f32x8::new(*chunk);
+        nan_mask |= next.simd_ne(next);
+        let replace: u32x8 = cast(next.simd_ge(values));
+        // Comparison masks have all-zero or all-one lanes, as select requires.
+        indices = replace.select(positions, indices);
+        // Retain max's NaN/zero handling and the original confidence bits.
+        values = values.max(next);
+        positions += u32x8::splat(8);
+    }
+
+    let mut best = f32::NEG_INFINITY;
+    let mut index = 0usize;
+    for (value, lane_index) in values.to_array().into_iter().zip(indices.to_array()) {
+        let lane_index = lane_index as usize;
+        if value > best || (value == best && lane_index > index) {
+            index = lane_index;
+        }
+        best = best.max(value);
+    }
+    let offset = chunks.len() * 8;
+    let mut has_nan = nan_mask.any();
+    for (i, &value) in remainder.iter().enumerate() {
+        has_nan |= value.is_nan();
+        if value >= best {
+            index = offset + i;
+        }
+        best = best.max(value);
+    }
+    // NaN max/compare behavior and signed-zero selection differ across targets.
+    // Preserve both the index and confidence via the original two-pass path.
+    if has_nan || best == 0.0 {
+        return argmax_two_pass_simd(row);
+    }
+    Some((index, best))
+}
+
+#[cfg(feature = "simd")]
+fn argmax_two_pass_simd(row: &[f32]) -> Option<(usize, f32)> {
+    if row.is_empty() {
+        return None;
+    }
     let max_val = reduce_max_simd(row);
     let mut idx = 0usize;
     for (i, &v) in row.iter().enumerate() {
@@ -210,19 +264,16 @@ fn reduce_max_simd(row: &[f32]) -> f32 {
     use wide::f32x8;
 
     let mut acc = f32x8::splat(f32::NEG_INFINITY);
-    let mut chunks = row.chunks_exact(8);
-    for chunk in &mut chunks {
-        // chunk has exactly 8 elements.
-        let v = f32x8::new([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
+    let (chunks, remainder) = row.as_chunks::<8>();
+    for chunk in chunks {
+        let v = f32x8::new(*chunk);
         acc = acc.max(v);
     }
     let mut best = f32::NEG_INFINITY;
     for lane in acc.to_array() {
         best = best.max(lane);
     }
-    for &v in chunks.remainder() {
+    for &v in remainder {
         best = best.max(v);
     }
     best
@@ -283,9 +334,9 @@ fn crnn_row_scalar(src_row: &[u8], sc: usize, dst_row: &mut [f32]) {
 fn crnn_row_simd(src_row: &[u8], sc: usize, dst_row: &mut [f32]) {
     use wide::f32x8;
 
-    let mut chunks = dst_row.chunks_exact_mut(8);
+    let (chunks, remainder) = dst_row.as_chunks_mut::<8>();
     let mut x = 0usize;
-    for chunk in &mut chunks {
+    for chunk in chunks {
         let g = [
             src_row[x * 3 + sc] as f32,
             src_row[(x + 1) * 3 + sc] as f32,
@@ -298,10 +349,10 @@ fn crnn_row_simd(src_row: &[u8], sc: usize, dst_row: &mut [f32]) {
         ];
         // Exact `(v / 255.0 - 0.5) / 0.5`, lane-wise.
         let v = (f32x8::new(g) / 255.0 - 0.5) / 0.5;
-        chunk.copy_from_slice(&v.to_array());
+        *chunk = v.to_array();
         x += 8;
     }
-    for d in chunks.into_remainder() {
+    for d in remainder {
         *d = (src_row[x * 3 + sc] as f32 / 255.0 - 0.5) / 0.5;
         x += 1;
     }
@@ -319,7 +370,7 @@ fn crnn_row_simd(src_row: &[u8], sc: usize, dst_row: &mut [f32]) {
 /// This is intentionally a tight contiguous scalar loop, *not* a hand-vectorized
 /// kernel: the output is an interleaved (strided) RGB scatter, which an explicit
 /// `wide` gather/scatter measured ~1.8x *slower* than letting the autovectorizer
-/// handle this `chunks_exact_mut(3)` form. The win over the previous
+/// handle this `as_chunks_mut::<3>()` form. The win over the previous
 /// `put_pixel` + 4-D strided `ndarray` indexing comes from the contiguous
 /// plane access alone (~1.8x faster than the old loop). Kept here next to the
 /// other post-processing kernels for cohesion.
@@ -331,7 +382,8 @@ pub fn scale_clamp_bgr_planes_to_rgb(
     scale: f32,
     out: &mut [u8],
 ) {
-    for (p, px) in out.chunks_exact_mut(3).enumerate() {
+    let (pixels, _) = out.as_chunks_mut::<3>();
+    for (p, px) in pixels.iter_mut().enumerate() {
         px[0] = to_u8(c2[p], scale);
         px[1] = to_u8(c1[p], scale);
         px[2] = to_u8(c0[p], scale);
@@ -388,6 +440,7 @@ mod tests {
 
     #[test]
     fn argmax_matches_scalar_including_ties() {
+        let bits = |result: Option<(usize, f32)>| result.map(|(i, value)| (i, value.to_bits()));
         // Tail-exercising length, with deterministic values.
         let row: Vec<f32> = (0..101).map(|i| ((i * 17) % 13) as f32 * 0.5).collect();
         assert_eq!(argmax(&row), argmax_scalar(&row));
@@ -400,6 +453,76 @@ mod tests {
         // Single element and empty.
         assert_eq!(argmax(&[42.0]), Some((0, 42.0)));
         assert_eq!(argmax(&[]), None);
+
+        for len in [1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 101] {
+            let mut row = vec![-3.0; len];
+            for i in [0, 6, 7, 8, 14, 15, 16, 23, 24, len - 1] {
+                if i < len {
+                    row[i] = 9.0;
+                    assert_eq!(bits(argmax(&row)), bits(argmax_scalar(&row)));
+                }
+            }
+            for zero in [-0.0, 0.0] {
+                for (i, value) in row.iter_mut().enumerate() {
+                    *value = if i.is_multiple_of(2) { zero } else { -zero };
+                }
+                #[cfg(feature = "simd")]
+                let expected = argmax_two_pass_simd(&row);
+                #[cfg(not(feature = "simd"))]
+                let expected = argmax_scalar(&row);
+                assert_eq!(bits(argmax(&row)), bits(expected), "zero ties, len={len}");
+                assert_eq!(argmax(&row).unwrap().0, len - 1);
+            }
+            for value in [
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+                -0.0,
+                0.0,
+                f32::NAN,
+                f32::from_bits(0xffc0_0123),
+                f32::from_bits(0x7f80_0001),
+            ] {
+                row.fill(value);
+                for i in 0..=len {
+                    // Also cover mixed exceptional values at every lane/tail boundary.
+                    if i > 0 {
+                        row[i - 1] = if i % 2 == 0 { -0.0 } else { f32::NAN };
+                    }
+                    #[cfg(feature = "simd")]
+                    let expected = argmax_two_pass_simd(&row);
+                    #[cfg(not(feature = "simd"))]
+                    let expected = argmax_scalar(&row);
+                    assert_eq!(bits(argmax(&row)), bits(expected), "len={len}, i={i}");
+                }
+            }
+        }
+        // A 9, NaN, 5 lane sequence must match the target's two-pass reduction,
+        // including payload and signaling NaNs.
+        for nan in [
+            f32::NAN,
+            f32::from_bits(0xffc0_0123),
+            f32::from_bits(0x7f80_0001),
+        ] {
+            for lane in 0..8 {
+                let mut row = vec![f32::NEG_INFINITY; 25];
+                row[lane] = 9.0;
+                row[lane + 8] = nan;
+                row[lane + 16] = 5.0;
+                #[cfg(feature = "simd")]
+                let expected = argmax_two_pass_simd(&row);
+                #[cfg(not(feature = "simd"))]
+                let expected = argmax_scalar(&row);
+                assert_eq!(bits(argmax(&row)), bits(expected), "lane={lane}");
+            }
+            let mut row = vec![1.0; 17];
+            row[0] = 9.0;
+            row[16] = nan; // The only NaN is in the scalar tail.
+            #[cfg(feature = "simd")]
+            let expected = argmax_two_pass_simd(&row);
+            #[cfg(not(feature = "simd"))]
+            let expected = argmax_scalar(&row);
+            assert_eq!(bits(argmax(&row)), bits(expected), "tail NaN");
+        }
     }
 
     #[test]
