@@ -34,6 +34,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Region (recognition crop) batch used when the caller does not set one.
+/// Fork default; see `OARStructureBuilder::build`.
+const DEFAULT_REGION_BATCH_SIZE: usize = 8;
+
 /// IoU threshold for removing overlapping layout elements (0.5 = 50% overlap).
 const LAYOUT_OVERLAP_IOU_THRESHOLD: f32 = 0.5;
 
@@ -1011,6 +1015,13 @@ impl OARStructureBuilder {
         resolve_opt_source(&mut self.text_line_orientation_model)?;
         resolve_opt_source(&mut self.text_recognition_model)?;
         resolve_opt_path(&mut self.character_dict_path)?;
+
+        // Fork: keep the structure pipeline's region batch at 8 unless the caller
+        // sets one. Upstream picks 64 whenever the first execution provider is an
+        // accelerator (even when it silently falls back to CPU) and 4 on CPU; on
+        // a WebGPU-first config the 64-crop recognition batches roughly double
+        // peak RSS (2.4 GB -> 4.8 GB on a 2000 px page with PP-OCRv5).
+        self.region_batch_size = self.region_batch_size.or(Some(DEFAULT_REGION_BATCH_SIZE));
 
         let cpu_region_batch_size = default_cpu_region_batch_size(
             self.text_recognition_model.as_ref(),
