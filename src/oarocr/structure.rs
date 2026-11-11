@@ -221,6 +221,8 @@ pub struct OARStructureBuilder {
     formula_recognition_type: Option<Result<FormulaModelKind, String>>,
     formula_tokenizer_path: Option<PathBuf>,
     formula_ort_session_config: Option<OrtSessionConfig>,
+    /// Session config for the table models only; `None` uses `ort_session_config`.
+    table_ort_session_config: Option<OrtSessionConfig>,
 
     // Optional seal text detection
     seal_text_detection_model: Option<ModelSource>,
@@ -352,6 +354,7 @@ impl OARStructureBuilder {
             formula_recognition_type: None,
             formula_tokenizer_path: None,
             formula_ort_session_config: None,
+            table_ort_session_config: None,
             seal_text_detection_model: None,
             text_detection_model: None,
             text_line_orientation_model: None,
@@ -831,6 +834,18 @@ impl OARStructureBuilder {
         self
     }
 
+    /// Sets an ONNX Runtime session configuration only for the table models
+    /// (classification, orientation, cell detection, structure recognition).
+    ///
+    /// Without it they use [`Self::ort_session`]. Useful to keep the table stack
+    /// on CPU while the rest runs on a GPU: on macOS WebGPU the RT-DETR cell
+    /// detectors and SLANeXt structure models take ~0.8 GB more than on CPU,
+    /// and SLANeXt is faster on CPU there.
+    pub fn table_ort_session(mut self, config: OrtSessionConfig) -> Self {
+        self.table_ort_session_config = Some(config);
+        self
+    }
+
     /// Integrates OCR into the pipeline for text extraction.
     ///
     /// # Arguments
@@ -895,6 +910,7 @@ impl OARStructureBuilder {
         for config in [
             self.ort_session_config.as_mut(),
             self.formula_ort_session_config.as_mut(),
+            self.table_ort_session_config.as_mut(),
         ] {
             apply_gpu_memory_budget(config, self.gpu_memory_budget)?;
         }
@@ -941,6 +957,7 @@ impl OARStructureBuilder {
         for config in [
             self.ort_session_config.as_mut(),
             self.formula_ort_session_config.as_mut(),
+            self.table_ort_session_config.as_mut(),
         ]
         .into_iter()
         .flatten()
@@ -978,6 +995,9 @@ impl OARStructureBuilder {
         self.ort_session_config = self.ort_session_config.map(OrtSessionConfig::resolve_auto);
         self.formula_ort_session_config = self
             .formula_ort_session_config
+            .map(OrtSessionConfig::resolve_auto);
+        self.table_ort_session_config = self
+            .table_ort_session_config
             .map(OrtSessionConfig::resolve_auto);
 
         // Resolve every model/dict/tokenizer path through the auto-download
@@ -1358,7 +1378,10 @@ impl OARStructureBuilder {
 impl TableModelSpec {
     fn from_builder(builder: &OARStructureBuilder) -> Self {
         Self {
-            ort_session_config: builder.ort_session_config.clone(),
+            ort_session_config: builder
+                .table_ort_session_config
+                .clone()
+                .or_else(|| builder.ort_session_config.clone()),
             table_classification_model: builder.table_classification_model.clone(),
             table_classification_config: builder.table_classification_config.clone(),
             table_orientation_model: builder.table_orientation_model.clone(),
@@ -4050,6 +4073,30 @@ mod tests {
             std::env::temp_dir().join(format!("oar-lazy-table-{}-{}", std::process::id(), name));
         std::fs::write(&path, b"x").expect("write temp file");
         path
+    }
+
+    #[test]
+    fn table_spec_uses_the_table_session_config_when_set() {
+        use oar_ocr_core::core::config::OrtExecutionProvider;
+        let shared = OrtSessionConfig::new().with_execution_providers(vec![
+            OrtExecutionProvider::WebGPU,
+            OrtExecutionProvider::CPU,
+        ]);
+        let cpu = OrtSessionConfig::new().with_execution_providers(vec![OrtExecutionProvider::CPU]);
+
+        let builder = OARStructureBuilder::new("layout.onnx").ort_session(shared.clone());
+        let spec = TableModelSpec::from_builder(&builder);
+        assert_eq!(
+            spec.ort_session_config.and_then(|c| c.execution_providers),
+            shared.execution_providers.clone(),
+            "without an override the tables share the pipeline's config"
+        );
+
+        let spec = TableModelSpec::from_builder(&builder.table_ort_session(cpu.clone()));
+        assert_eq!(
+            spec.ort_session_config.and_then(|c| c.execution_providers),
+            cpu.execution_providers,
+        );
     }
 
     #[test]
